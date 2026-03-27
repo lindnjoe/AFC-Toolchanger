@@ -786,24 +786,6 @@ class afcAMS(afcUnit):
             self._cached_oams_manager = None
         return self._cached_oams_manager
 
-    def _manager_load_for_lane(self, lane_name: str):
-        manager = self._get_oams_manager()
-        if manager is None:
-            return False, "OpenAMS manager not available"
-        return manager.load_filament_for_lane(lane_name)
-
-    def _manager_unload_with_prep_for_fps(self, fps_name: str):
-        manager = self._get_oams_manager()
-        if manager is None:
-            return False, "OpenAMS manager not available"
-        return manager.unload_filament_with_prep_for_fps(fps_name)
-
-    def _manager_clear_fps_state_for_lane(self, lane_name: str, *, eventtime: float):
-        manager = self._get_oams_manager()
-        if manager is None:
-            return False, None, None
-        return manager.clear_fps_state_for_lane(lane_name, eventtime=eventtime)
-
     # ---- Dock purge (AFC-owned, same pattern as ACE) ----
 
     def _dock_purge_dropoff(self):
@@ -928,6 +910,33 @@ class afcAMS(afcUnit):
         unload_speed = unload_speed * 60.0 if unload_speed is not None else None
         return unload_length, unload_speed
 
+    # ---- State queries (AFC is source of truth) ----
+
+    def get_loaded_lane_for_extruder(self, extruder_name):
+        """Return the lane name currently loaded on the given extruder, per AFC.
+
+        This is the authoritative answer — oams_manager should use this
+        instead of its own sensor-based detection when possible.
+
+        :param extruder_name: Extruder name (e.g. 'extruder4')
+        :return: Lane name (e.g. 'lane5') or None
+        """
+        tool = self.afc.tools.get(extruder_name)
+        if tool is not None:
+            return tool.lane_loaded
+        return None
+
+    def is_lane_loaded(self, lane_name):
+        """Check if a specific lane is loaded to its extruder, per AFC.
+
+        :param lane_name: Lane name to check
+        :return: True if lane is loaded to toolhead
+        """
+        lane = self.afc.lanes.get(lane_name)
+        if lane is None:
+            return False
+        return (lane.extruder_obj.lane_loaded == lane_name)
+
     def load_sequence(self, cur_lane, cur_hub, cur_extruder):
         """OpenAMS load sequence — AFC-owned orchestration.
 
@@ -959,6 +968,22 @@ class afcAMS(afcUnit):
             afc.afcDeltaTime.major_delta_time = now
             afc.afcDeltaTime.last_time = now
 
+        # Pre-load check: if a DIFFERENT lane is loaded on this extruder,
+        # auto-unload it first. AFC owns this decision, not oams_manager.
+        existing_lane = cur_extruder.lane_loaded
+        if existing_lane and existing_lane != cur_lane.name:
+            self.logger.info(
+                f"Auto-unloading {existing_lane} before loading {cur_lane.name} "
+                f"(AFC pre-load cleanup)")
+            try:
+                afc.gcode.run_script_from_command(f"TOOL_UNLOAD LANE={existing_lane}")
+                afc.toolhead.wait_moves()
+            except Exception as e:
+                afc.error.handle_lane_failure(
+                    cur_lane,
+                    f"Failed to auto-unload {existing_lane} before loading {cur_lane.name}: {e}")
+                return False
+
         # Dock purge phase 1: drop off tool before feeding filament
         dock_dropped_off = False
         if self._is_dock_purge_enabled():
@@ -979,7 +1004,7 @@ class afcAMS(afcUnit):
                 afc.error.handle_lane_failure(cur_lane, "OpenAMS load failed: oams_manager not available")
                 return False
 
-            success, message = self._manager_load_for_lane(cur_lane.name)
+            success, message = oams_manager.load_filament_for_lane(cur_lane.name)
             if not success:
                 message = message or f"OpenAMS load failed for {cur_lane.name}"
                 afc.error.handle_lane_failure(cur_lane, message)
@@ -1104,7 +1129,7 @@ class afcAMS(afcUnit):
                     cur_lane.name, fps_name
                 )
             )
-            success, message = self._manager_unload_with_prep_for_fps(fps_name)
+            success, message = oams_manager.unload_filament_with_prep_for_fps(fps_name)
             if not success:
                 message = message or "OpenAMS unload failed for {}".format(cur_lane.name)
                 afc.error.handle_lane_failure(cur_lane, message)
@@ -1155,8 +1180,10 @@ class afcAMS(afcUnit):
         # Handle cross-extruder runout FPS state cleanup
         if getattr(cur_lane, '_oams_cross_extruder_runout', False):
             try:
-                cleared, fps_name, spool_index = self._manager_clear_fps_state_for_lane(
-                    lane_name, eventtime=self.reactor.monotonic())
+                mgr = self._get_oams_manager()
+                cleared, fps_name, spool_index = (
+                    mgr.clear_fps_state_for_lane(lane_name, eventtime=self.reactor.monotonic())
+                    if mgr is not None else (False, None, None))
                 if cleared and fps_name:
                     self.logger.debug(f"Cross-Extruder: Cleared FPS state for {fps_name} (was spool {spool_index})")
                     try:
