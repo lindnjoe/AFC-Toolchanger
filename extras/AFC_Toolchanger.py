@@ -57,8 +57,25 @@ class AfcToolchanger(afcUnit):
         super().__init__(config)
         self.config = config
         self.type = config.get("type", "Toolchanger")
-        self.logo       = '<span class=success--text>Toolchanger Ready\n</span>'
-        self.logo_error = '<span class=error--text>Toolchanger Not Ready</span>\n'
+        firstLeg = '<span class=warning--text>|</span><span class=success--text>_</span>'
+        secondLeg = firstLeg + '<span class=warning--text>|</span>'
+        self._logo_base  = '<span class=success--text>'
+        self._logo_base += 'R  ___ ___ ____\n'
+        self._logo_base += 'E |_T_|_T_|  </span><span class=info--text>o</span><span class=success--text> |\n'
+        self._logo_base += 'A |       |/ __/\n'
+        self._logo_base += 'D |_________/\n'
+        self._logo_base += 'Y {first}{second} {first}{second}\n'.format(first=firstLeg, second=secondLeg)
+        self._logo_base += '  ' + self.name + '</span>'
+
+        firstLeg_e = '<span class=warning--text>|</span><span class=error--text>_</span>'
+        secondLeg_e = firstLeg_e + '<span class=warning--text>|</span>'
+        self.logo_error  = '<span class=error--text>'
+        self.logo_error += 'E  ___ ___ ____\n'
+        self.logo_error += 'R |_X_|_X_|  </span><span class=secondary--text>X</span><span class=error--text> |\n'
+        self.logo_error += 'R |       |/ __/\n'
+        self.logo_error += 'O |_________/\n'
+        self.logo_error += 'R {first}{second} {first}{second}\n'.format(first=firstLeg_e, second=secondLeg_e)
+        self.logo_error += '  ' + self.name + '</span>\n'
         self.functions: afcFunction = self.printer.load_object(config, 'AFC_functions')
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
         self.gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -68,6 +85,18 @@ class AfcToolchanger(afcUnit):
         self.require_tool_present: bool = config.getboolean('require_tool_present', True)
         self.verify_tool_pickup: bool = config.getboolean('verify_tool_pickup', True)
         self.transfer_fan_speed: bool = config.getboolean('transfer_fan_speed', True)
+
+        # Crash detection — monitors detection pins during printing to detect
+        # if a tool falls off the shuttle mid-print.
+        self.crash_detection_enabled: bool = config.getboolean('crash_detection', False)
+        self.crash_mintime: float = config.getfloat('crash_mintime', 0.5, above=0.)
+        self._crash_watchdog_interval: float = config.getfloat('crash_watchdog_interval', 0.5, above=0.)
+        self._crash_watchdog_threshold: int = config.getint('crash_watchdog_threshold', 2, minval=1)
+        self._crash_enable_grace: float = config.getfloat('crash_enable_grace', 2.0, minval=0.)
+        self._crash_active = False
+        self._crash_watchdog_timer = None
+        self._crash_watchdog_errors = 0
+        self._crash_enable_time = 0.0
 
         # Default gcode templates (can be overridden per-tool in AFC_extruder)
         self.default_before_change_gcode = self.gcode_macro.load_template(
@@ -147,6 +176,15 @@ class AfcToolchanger(afcUnit):
         self.gcode.register_command("VERIFY_TOOL_DETECTED",
                                     self.cmd_VERIFY_TOOL_DETECTED,
                                     desc="Verify expected tool is detected on shuttle")
+        self.gcode.register_command("START_TOOL_CRASH_DETECTION",
+                                    self.cmd_START_TOOL_CRASH_DETECTION,
+                                    desc="Enable tool crash detection")
+        self.gcode.register_command("STOP_TOOL_CRASH_DETECTION",
+                                    self.cmd_STOP_TOOL_CRASH_DETECTION,
+                                    desc="Disable tool crash detection")
+        self.gcode.register_command("TOOLCHANGER_PREP",
+                                    self.cmd_TOOLCHANGER_PREP,
+                                    desc="Scan detection pins and report toolchanger status")
 
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_tc_connect)
@@ -164,12 +202,18 @@ class AfcToolchanger(afcUnit):
                                          self.cmd_AFC_SET_TOOLHEAD_LED_help,
                                          self.cmd_AFC_SET_TOOLHEAD_LED_options)
 
+    @property
+    def logo(self):
+        """Dynamic logo with detection pin status for PREP output."""
+        ok, detail = self.prep_check()
+        return self._logo_base + '\n ' + detail + '\n'
+
     def _handle_tc_connect(self):
         """Install the gcode offset transform on connect and find tool_probe_endstop."""
         self.gcode_transform.next_transform = self.gcode_move.set_move_transform(
             self.gcode_transform, force=True)
         self.tool_probe_endstop = self.printer.lookup_object(
-            'tool_probe_endstop', None)
+            'AFC_tool_probe_endstop', None)
 
     def require_fan_switcher(self):
         """Create fan switcher on demand when a tool has a fan configured."""
@@ -181,7 +225,7 @@ class AfcToolchanger(afcUnit):
     def register_tool(self, extruder, number):
         """Register an AFC_extruder as a tool with the given number."""
         if number in self.tools:
-            self.logger.warning("Toolchanger: replacing tool T%d" % number)
+            self.logger.warning("Toolchanger: replacing tool_number %d" % number)
             self.tool_numbers.remove(number)
             self.tool_names.remove(self.tools[number].name)
         self.tools[number] = extruder
@@ -192,7 +236,8 @@ class AfcToolchanger(afcUnit):
         # configured, not whether it has been sampled yet (detect_state
         # starts at -1/UNAVAILABLE until the first callback fires).
         self.has_detection = any(
-            t.detect_pin_name is not None for t in self.tools.values())
+            t.detect_pin_name is not None or getattr(t, 'tool_probe', None) is not None
+            for t in self.tools.values())
         # Register T<n> gcode command
         self._register_t_command(extruder, number)
 
@@ -271,6 +316,7 @@ class AfcToolchanger(afcUnit):
         if self.status != STATUS_READY:
             raise gcmd.error(
                 "Cannot enter docking mode, status is %s" % self.status)
+        self.stop_crash_detection()
         self.status = STATUS_CHANGING
         self._save_state("", None)
         self._set_toolchange_transform()
@@ -280,6 +326,8 @@ class AfcToolchanger(afcUnit):
             raise gcmd.error(
                 "Cannot exit docking mode, status is %s" % self.status)
         self._restore_state_and_transform(self.active_tool)
+        if self.active_tool:
+            self.start_crash_detection()
         self.status = STATUS_READY
 
     def _resolve_tool_from_gcmd(self, gcmd):
@@ -404,6 +452,65 @@ class AfcToolchanger(afcUnit):
                 self.error_message = 'Exception during initialization'
             raise
 
+    def prep_check(self):
+        """Scan detection pins and report toolchanger status.
+
+        Returns (ok, message) tuple. Checks:
+        - Detection pin conflicts (multiple tools reading PRESENT)
+        - Tool probe conflicts (multiple probes triggered)
+        - Identifies which tool is on the shuttle (if any)
+        - Reports any tools with unavailable detection (-1)
+        """
+        if not self.has_detection:
+            return True, "No detection pins configured — skipping prep check"
+
+        # Let detection pin callbacks settle
+        reactor = self.printer.get_reactor()
+        reactor.pause(reactor.monotonic() + 0.3)
+
+        present = []
+        absent = []
+        unavailable = []
+
+        for tool in self.tools.values():
+            if tool.detect_state == DETECT_PRESENT:
+                present.append(tool)
+            elif tool.detect_state == 0:  # ABSENT
+                absent.append(tool)
+            else:
+                unavailable.append(tool)
+
+        parts = []
+
+        if len(present) > 1:
+            names = ', '.join(t.name for t in present)
+            msg = (
+                "CONFLICT: Multiple tools detected on shuttle: %s. "
+                "Check detection pins — only one tool should read PRESENT."
+                % names)
+            self.logger.error(msg)
+            return False, msg
+
+        if len(present) == 1:
+            parts.append("Shuttle: %s" % present[0].name)
+        else:
+            parts.append("Shuttle: empty")
+
+        if absent:
+            parts.append("Docked: %s" % ', '.join(t.name for t in absent))
+
+        if unavailable:
+            names = ', '.join(t.name for t in unavailable)
+            parts.append("No detection: %s" % names)
+
+        msg = " | ".join(parts)
+        return True, msg
+
+    def cmd_TOOLCHANGER_PREP(self, gcmd):
+        """Run toolchanger prep check — scan detection pins and report status."""
+        ok, msg = self.prep_check()
+        gcmd.respond_info(msg)
+
     def select_tool(self, gcmd, tool, restore_axis):
         """Core tool change: dropoff current, pickup new, manage offsets."""
         if self.status == STATUS_UNINITIALIZED:
@@ -419,6 +526,8 @@ class AfcToolchanger(afcUnit):
             return
 
         try:
+            # Stop crash detection before tool change
+            self.stop_crash_detection()
             self._ensure_homed(gcmd)
             self.status = STATUS_CHANGING
             self._save_state(restore_axis, tool)
@@ -454,8 +563,10 @@ class AfcToolchanger(afcUnit):
             self._restore_state_and_transform(tool)
             self.status = STATUS_READY
             if tool:
-                self.logger.info('Selected tool %s (%s)' % (
-                    str(tool.tool_number), tool.name))
+                self.logger.info('Selected %s (tool_number %d)' % (
+                    tool.name, tool.tool_number))
+                # Re-enable crash detection after successful pickup
+                self.start_crash_detection()
             else:
                 self.logger.info('Tool unselected')
 
@@ -472,6 +583,26 @@ class AfcToolchanger(afcUnit):
     def system_Test(self, cur_lane: AFCLane, delay: float, assignTcmd: str, enable_movement: bool):
         msg = ""
         succeeded = True
+
+        # Track on-shuttle count across lanes — reset on first lane
+        first_lane = next(iter(self.lanes.values()), None)
+        if first_lane is not None and cur_lane.name == first_lane.name:
+            self._prep_on_shuttle = []
+
+        # Check detection pin for this lane's extruder
+        extruder = cur_lane.extruder_obj
+        if extruder is not None and extruder.on_shuttle():
+            msg += "<span class=info--text>ON SHUTTLE</span> "
+            self._prep_on_shuttle.append(cur_lane.name)
+
+        # After last lane, check for conflicts
+        last_lane = list(self.lanes.values())[-1] if self.lanes else None
+        if last_lane is not None and cur_lane.name == last_lane.name:
+            if len(self._prep_on_shuttle) > 1:
+                names = ', '.join(self._prep_on_shuttle)
+                self.logger.error(
+                    "CONFLICT: Multiple tools detected on shuttle: %s. "
+                    "Check detection pins." % names)
 
         if not cur_lane.prep_state:
             if not cur_lane.load_state:
@@ -500,7 +631,7 @@ class AfcToolchanger(afcUnit):
                     # so also trust on_shuttle() detection pin as validation
                     tool_ready = (
                         cur_lane.get_toolhead_pre_sensor_state()
-                        or cur_lane.extruder_obj.is_buffer
+                        or cur_lane.extruder_obj.tool_start == "buffer"
                         or cur_lane.extruder_obj.tool_end_state
                         or cur_lane.extruder_obj.on_shuttle()
                     )
@@ -515,7 +646,7 @@ class AfcToolchanger(afcUnit):
                             )
                         msg += f"<span class=primary--text> in ToolHead{on_shuttle}</span>"
 
-                        if (cur_lane.extruder_obj.is_buffer
+                        if (cur_lane.extruder_obj.tool_start == "buffer"
                             and (not self.afc.homing_enabled
                                  or not self.enable_buffer_tool_check)):
                             msg += "<span class=warning--text>\n Ram sensor enabled, confirm tool is loaded</span>"
@@ -732,6 +863,132 @@ class AfcToolchanger(afcUnit):
         if raise_error:
             raise raise_error(message)
 
+    # ---- Crash detection ----
+
+    def start_crash_detection(self):
+        """Enable crash detection — monitors detection pins for tool loss.
+
+        Called automatically after successful tool pickup. Can also be called
+        manually via START_TOOL_CRASH_DETECTION gcode.
+        """
+        if not self.crash_detection_enabled or not self.has_detection:
+            return
+        if not self.active_tool:
+            return
+        self._crash_watchdog_errors = 0
+        self._crash_enable_time = self.printer.get_reactor().monotonic()
+        self._crash_active = True
+        # Start watchdog timer
+        if self._crash_watchdog_timer is None:
+            self._crash_watchdog_timer = self.printer.get_reactor().register_timer(
+                self._crash_watchdog_tick,
+                self.printer.get_reactor().monotonic() + self._crash_watchdog_interval)
+        self.logger.info("tool_crash: enabled")
+
+    def stop_crash_detection(self):
+        """Disable crash detection — called before tool change operations.
+
+        Called automatically when select_tool() begins (STATUS_CHANGING).
+        Can also be called manually via STOP_TOOL_CRASH_DETECTION gcode.
+        """
+        self._crash_active = False
+        self._crash_watchdog_errors = 0
+        if self._crash_watchdog_timer is not None:
+            self.printer.get_reactor().unregister_timer(self._crash_watchdog_timer)
+            self._crash_watchdog_timer = None
+        self.logger.info("tool_crash: disabled")
+
+    def _crash_watchdog_tick(self, eventtime):
+        """Periodic watchdog check — verify active tool is still detected."""
+        if not self._crash_active or not self.active_tool:
+            self._crash_watchdog_timer = None
+            return self.printer.get_reactor().NEVER
+
+        # Grace period after enable
+        if eventtime - self._crash_enable_time < self._crash_enable_grace:
+            return eventtime + self._crash_watchdog_interval
+
+        # Skip during tool changes or initialization
+        if self.status in (STATUS_CHANGING, STATUS_INITIALIZING, STATUS_UNINITIALIZED):
+            return eventtime + self._crash_watchdog_interval
+
+        # Check if active tool is still detected.
+        # Uses detection pin (Cartographer/Beacon) OR tool probe (Optotap/Tap)
+        # depending on what the extruder has configured.
+        active = self.active_tool
+        tool_present = self._is_tool_present(active)
+        if not tool_present:
+            self._crash_watchdog_errors += 1
+            if self._crash_watchdog_errors >= self._crash_watchdog_threshold:
+                self._do_crash(
+                    "tool_crash: watchdog detected loss of %s" % active.name,
+                    eventtime)
+                return self.printer.get_reactor().NEVER
+        else:
+            self._crash_watchdog_errors = 0
+
+        return eventtime + self._crash_watchdog_interval
+
+    def _is_tool_present(self, tool):
+        """Check if a tool is present on the shuttle.
+
+        Uses whichever detection method the tool has configured:
+        - detection_pin: checks detect_state (Cartographer/Beacon setups)
+        - tool_probe: queries the probe endstop (Optotap/Tap setups)
+
+        :param tool: AFCExtruder tool object
+        :return: True if tool is detected on shuttle
+        """
+        if tool is None:
+            return False
+
+        # Check detection pin first (Cartographer/Beacon)
+        if tool.detect_pin_name is not None:
+            return tool.detect_state == DETECT_PRESENT
+
+        # Check tool probe (Optotap/Tap) — query the endstop directly
+        if tool.tool_probe is not None:
+            try:
+                toolhead = self.printer.lookup_object('toolhead')
+                print_time = toolhead.get_last_move_time()
+                triggered = tool.tool_probe.mcu_probe.query_endstop(print_time)
+                # For tool probes: NOT triggered = tool present (probe is open
+                # when tool is on shuttle, triggered when touching surface)
+                return not triggered
+            except Exception:
+                return True  # Assume present on query failure
+
+        # No detection method configured
+        return True
+
+    def _do_crash(self, message, eventtime):
+        """Handle a detected tool crash — disable detection and error."""
+        self._crash_active = False
+        if self._crash_watchdog_timer is not None:
+            self.printer.get_reactor().unregister_timer(self._crash_watchdog_timer)
+            self._crash_watchdog_timer = None
+        self.logger.error(message)
+
+        # Use error_gcode if configured, otherwise shutdown
+        if self.error_gcode:
+            try:
+                self.printer.get_reactor().register_callback(
+                    lambda _: self._run_gcode('error_gcode', self.error_gcode, {}),
+                    eventtime + self.crash_mintime)
+            except Exception as e:
+                self.logger.error("crash gcode failed: %s" % e)
+                self.printer.invoke_shutdown(message)
+        else:
+            self.printer.invoke_shutdown(message)
+
+    def cmd_START_TOOL_CRASH_DETECTION(self, gcmd):
+        """Enable tool crash detection manually."""
+        self.start_crash_detection()
+
+    def cmd_STOP_TOOL_CRASH_DETECTION(self, gcmd):
+        """Disable tool crash detection manually."""
+        self.stop_crash_detection()
+
     def _gcmd_tool(self, gcmd, default=None):
         """Resolve tool from TOOL= or T= gcode parameters."""
         tool_name = gcmd.get('TOOL', None)
@@ -830,8 +1087,8 @@ class AfcToolchanger(afcUnit):
         :param lane: The lane object whose extruder/toolhead should be activated.
         :param set_start_time: Set true to set a starting time for afcDeltaTime.
         """
-        # OpenAMS suppresses timing during its own load sequence
-        if self.afc._oams_suppress_tool_swap_timer:
+        # Units can suppress timing during their own load sequences
+        if getattr(self.afc, '_suppress_tool_swap_timer', False):
             set_start_time = False
         if set_start_time:
             self.afc.afcDeltaTime.set_start_time()

@@ -653,6 +653,18 @@ class afcUnit:
         """
         pass
 
+    def lane_move(self, cur_lane, distance, speed_mode):
+        """Move filament in a lane by the given distance.
+
+        Default implementation uses the lane's stepper motor (BoxTurtle, etc.).
+        Override in subclass for hardware-specific movement (ACE serial, OpenAMS).
+
+        :param cur_lane: Lane object to move
+        :param distance: Distance in mm (positive = forward, negative = retract)
+        :param speed_mode: SpeedMode enum for movement speed
+        """
+        cur_lane.move_advanced(distance, speed_mode, assist_active=AssistActive.YES)
+
     def load_sequence(self, cur_lane, cur_hub, cur_extruder):
         """Override in subclass for custom load logic. Return non-None to skip default AFC load."""
         return None
@@ -874,7 +886,7 @@ class afcUnit:
         # when load_then_home is enabled
         load_and_home = lane.load_then_home_var and distance > lane.load_undershoot
         if (load_and_home
-            and lane.extruder_obj.is_buffer):
+            and lane.extruder_obj.tool_start == "buffer"):
             load_length = distance - lane.load_undershoot
             home, dist, warn = lane.move_to(load_length, speed_mode, assist_active=assist_active,
                                             endstop=endstop, use_homing=False)

@@ -48,6 +48,8 @@ def _make_fps_buffer(name="FPS_buffer1", overrides=None):
     buf.current_lane = None
     buf.advance_state = False
     buf.trailing_state = False
+    buf._advance_latched = False
+    buf._latch_enabled = False
     buf.debug = False
 
     # ADC defaults
@@ -569,7 +571,7 @@ class TestEdgeCases:
         buf.current_lane.update_rotation_distance.assert_called_with(pytest.approx(1.5))
 
 
-# ── Extruder Property (oams_manager compatibility) ──────────────────────────
+# ── Extruder Property (OAMSMonitor compatibility) ──────────────────────────
 
 class TestExtruderProperty:
     def test_returns_active_extruder(self):
@@ -587,12 +589,12 @@ class TestExtruderProperty:
         assert buf.extruder is None
 
     def test_oams_style_access_pattern(self):
-        """Verify the fps.extruder.last_position pattern used by oams_manager."""
+        """Verify the fps.extruder.last_position pattern used by OAMSMonitor."""
         buf = _make_fps_buffer()
         mock_extruder = MagicMock()
         mock_extruder.last_position = 100.0
         buf.toolhead.get_extruder.return_value = mock_extruder
-        # This is the exact pattern oams_manager uses:
+        # This is the exact pattern OAMSMonitor uses:
         pos = float(getattr(buf.extruder, "last_position", 0.0))
         assert pos == 100.0
 

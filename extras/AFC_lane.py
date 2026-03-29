@@ -319,8 +319,7 @@ class AFCLane:
             and "extruder" not in self.name): # Protects against standalone lanes
             self._get_extruder_object()
             pin = self.extruder_obj.tool_start
-            if ("buffer" not in pin
-                and not str(pin).strip().upper().startswith("FPS_")):
+            if "buffer" not in pin:
                 self._set_homing_endstop(query_endstops, ppins,
                                          pin, AFCHomingPoints.TOOL)
 
@@ -613,23 +612,14 @@ class AFCLane:
         if self.buffer_name is not None:
             self._get_buffer_object()
 
-        # Checking if buffer was defined in extruder if not defined in unit/stepper
+        # Checking if buffer was defined in extruder or unit if not defined in lane/stepper
         elif (self.buffer_obj is None
-              and self.extruder_obj.tool_start == "buffer"
-              and len(self.extruder_obj.lanes) > 1):
-            if self.extruder_obj.buffer_name is not None:
-                self.buffer_obj = self.printer.lookup_object("AFC_buffer {}".format(self.extruder_obj.buffer_name))
-            else:
-                error_string = 'Error: Buffer was defined as tool_start in [AFC_extruder {extruder}] config, but buffer variable has not been configured. Please add buffer variable to either [AFC_extruder {extruder}], [AFC_stepper {name}] or [AFC_{unit_type} {unit_name}] section in your config file'.format(
-                    extruder=self.extruder_obj.name, name=self.name, unit_type=self.unit_obj.type.replace("_", ""), unit_name=self.unit_obj.name )
-                raise error(error_string)
-
-        # FPS buffer: tool_start references the FPS buffer name directly (e.g. "FPS_buffer1")
-        elif (self.buffer_obj is None
-              and self.extruder_obj.is_buffer
-              and self.extruder_obj.tool_start != "buffer"):
-            fps_name = self.extruder_obj.tool_start
-            self.buffer_obj = self.printer.lookup_object("AFC_buffer {}".format(fps_name), None)
+              and self.extruder_obj.tool_start == "buffer"):
+            # Resolve buffer name: extruder config, then unit config
+            buf_name = self.extruder_obj.buffer_name or getattr(self.unit_obj, 'buffer_name', None)
+            if buf_name is not None:
+                self.buffer_obj = self.printer.lookup_object("AFC_buffer {}".format(buf_name))
+            # No buffer found — valid for units that don't need one on a shared extruder
 
         # Valid to not have a buffer defined, check to make sure object exists before adding lane to buffer
         if self.buffer_obj is not None and add_to_other_obj:
@@ -1563,7 +1553,7 @@ class AFCLane:
 
         returns Status of toolhead pre sensor or the current buffer advance state
         """
-        if self.extruder_obj.is_buffer and self.buffer_obj is not None:
+        if self.extruder_obj.tool_start == "buffer" and self.buffer_obj is not None:
             return self.buffer_obj.advance_state
         else:
             return self.extruder_obj.tool_start_state
@@ -1575,7 +1565,7 @@ class AFCLane:
         :return AFCHomingPoints: Returns buffer endstop name if users tool_start is set to buffer
             else returns tool start endstop name
         """
-        if self.extruder_obj.is_buffer:
+        if self.extruder_obj.tool_start == "buffer":
             return self.buffer_endstop_name
         else:
             return self.tool_endstop_name
