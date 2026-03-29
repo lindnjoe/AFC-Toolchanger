@@ -42,7 +42,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.1.0"
+AFC_VERSION="1.1.10"
 
 # Class for holding different states so its clear what all valid states are
 class State:
@@ -93,6 +93,7 @@ class afc:
         self.moonraker          = None
         self.td1_defined        = False
         self._td1_present       = False
+        self._last_td1_query: float = 0
         self.lane_data_enabled  = False
         self.prep_done          = False         # Variable used to hold of save_vars function from saving too early and overriding save before prep can be ran
         self.in_print_timer     = None
@@ -119,7 +120,6 @@ class afc:
         self.change_tool_pos = None
         self.in_toolchange = False
         self.tool_start = None
-        self._oams_suppress_tool_swap_timer = False
 
         # Save/resume pos variables
         self.base_position = [0.0, 0.0, 0.0, 0.0]
@@ -510,13 +510,20 @@ class afc:
 
     @property
     def td1_present(self):
-        present = self._td1_present
-        if self.printer.state_message == 'Printer is ready' and self.moonraker is not None:
-            if not self.function.is_printing(check_movement=True):
-                present = self.moonraker.check_for_td1()[1]
-                self._td1_present = present
+        """Return cached TD1 presence, refreshing at most every 30 seconds.
 
-        return present
+        Previously this called moonraker.check_for_td1() on every status poll
+        (up to 4 times/sec), which consumed ~25% CPU on low-end boards.
+        """
+        now = self.reactor.monotonic()
+        if (self.printer.state_message == 'Printer is ready'
+            and self.moonraker is not None
+            and not self.function.is_printing(check_movement=True)
+            and (now - self._last_td1_query) >= 30.0):
+            self._last_td1_query = now
+            self._td1_present = self.moonraker.check_for_td1()[1]
+
+        return self._td1_present
 
     def _reset_file_callback(self):
         """
@@ -864,7 +871,7 @@ class afc:
         if abs(distance) >= 200: speed_mode = SpeedMode.LONG
 
         cur_lane.set_load_current() # Making current is set correctly when doing lane moves
-        cur_lane.move_advanced(distance, speed_mode, assist_active = AssistActive.YES)
+        cur_lane.unit_obj.lane_move(cur_lane, distance, speed_mode)
         cur_lane.do_enable(False)
         self.current_state = State.IDLE
         cur_lane.unit_obj.return_to_home()
@@ -1542,7 +1549,7 @@ class afc:
             # Check if ramming is enabled, if it is, go through ram load sequence.
             # Lane will load until Advance sensor is True
             # After the tool_stn distance the lane will retract off the sensor to confirm load and reset buffer
-            if cur_extruder.is_buffer:
+            if cur_extruder.tool_start == "buffer":
                 cur_lane.unsync_to_extruder()
                 load_checks = 0
                 while cur_lane.get_toolhead_pre_sensor_state():
@@ -1782,7 +1789,7 @@ class afc:
 
             # Attempt to unload the filament from the extruder, retrying if needed.
             num_tries = 0
-            if cur_extruder.is_buffer:
+            if cur_extruder.tool_start == "buffer":
                 # if ramming is enabled, AFC will retract to collapse buffer before unloading
                 cur_lane.unsync_to_extruder()
                 while not cur_lane.get_trailing() and self.tool_max_unload_attempts > 0:
@@ -2345,21 +2352,12 @@ class afc:
                                 )
                                 return
 
-            # Fall back to tool_number lookup for setups where T<n> refers
-            # to a physical extruder rather than a lane map entry.
-            if extruder is None:
-                for tool_obj in self.tools.values():
-                    if getattr(tool_obj, 'tool_number', -1) == toolnum:
-                        extruder = tool_obj
-                        self.logger.debug(
-                            "M109 T%d: tool_number fallback -> %s"
-                            % (toolnum, extruder.name))
-                        break
-
+            # T# must resolve through AFC's lane map. If no lane maps to this
+            # T number, it's an error — we don't fall back to tool_number matching.
             if extruder is not None:
                 self.logger.debug("Setting temperature for {} to {}".format(extruder, temp))
             else:
-                self.logger.error("extruder not configured for T{}".format(toolnum))
+                self.logger.error("No lane mapped to T{} — cannot resolve extruder".format(toolnum))
                 return
         elif extruder_name is None:
             extruder = self.toolhead.get_extruder()

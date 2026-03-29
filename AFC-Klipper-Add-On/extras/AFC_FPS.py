@@ -25,8 +25,8 @@
 # provides the ADC reading.  The unit's own code (AFC_OpenAMS) manages
 # tool_start_state and virtual sensors exactly as it already does — this
 # driver just acts as the FPS hardware interface and config entry point.
-# Set  pin_tool_start: <FPS_buffer_name>  on the extruder so Klipper
-# doesn't try to register a GPIO pin for it.
+# Set  pin_tool_start: buffer  and  buffer: <FPS_buffer_name>  on
+# the extruder so Klipper treats it as a buffer, not a GPIO pin.
 
 from __future__ import annotations
 
@@ -130,6 +130,8 @@ class AFCFPSBuffer:
         self.current_lane: Optional[AFCLane | AFCExtruderStepper] = None
         self.advance_state = False
         self.trailing_state = False
+        self._advance_latched = False
+        self._latch_enabled = False  # Only latch during active loads
         self.toolhead = None  # Set in _handle_ready
 
         self.debug = config.getboolean("debug", False)
@@ -229,6 +231,20 @@ class AFCFPSBuffer:
             "enable_sensors_in_gui", self.afc.enable_sensors_in_gui
         )
 
+        # ---- Register virtual filament sensors for GUI display ----
+        # Same pattern as TurtleNeck buffer which registers advance/trailing sensors.
+        # These let Mainsail show buffer state (grey = ramming mode) instead of
+        # red (no sensor). The VirtualFilamentSensor tracks advance/trailing state
+        # that gets updated in _adc_callback.
+        self.adv_filament_switch_name = f"{self.name}_expanded"
+        self.fila_adv = VirtualFilamentSensor(
+            self.printer, self.adv_filament_switch_name,
+            show_in_gui=self.enable_sensors_in_gui)
+        self.trail_filament_switch_name = f"{self.name}_compressed"
+        self.fila_trail = VirtualFilamentSensor(
+            self.printer, self.trail_filament_switch_name,
+            show_in_gui=self.enable_sensors_in_gui)
+
         # ---- Correction timer ----
         self.correction_timer = self.reactor.register_timer(self._correction_event)
 
@@ -302,11 +318,11 @@ class AFCFPSBuffer:
     def extruder(self):
         """Return the active toolhead extruder.
 
-        The native fps.py stored a direct extruder reference.  oams_manager
-        accesses ``fps.extruder.last_position`` in many places for runout
-        coasting and clog detection.  This property provides the same
-        interface without requiring an extruder config option — it simply
-        returns whatever extruder is currently active on the toolhead.
+        The native fps.py stored a direct extruder reference.  OAMSMonitor
+        accesses ``fps.extruder.last_position`` for clog detection.
+        This property provides the same interface without requiring an
+        extruder config option — it simply returns whatever extruder is
+        currently active on the toolhead.
         """
         if self.toolhead is not None:
             return self.toolhead.get_extruder()
@@ -369,7 +385,13 @@ class AFCFPSBuffer:
             if self.smoothed_fps > self.set_point + half_db:
                 self.last_state = ADVANCING_STATE_NAME
                 self.advance_state = True
+                if self._latch_enabled:
+                    self._advance_latched = True
                 self.trailing_state = False
+            elif self._advance_latched:
+                # Latched during load: keep advance_state True even if
+                # pressure drops briefly between ACE motor pulses.
+                self.advance_state = True
             elif self.smoothed_fps < self.set_point - half_db:
                 self.last_state = TRAILING_STATE_NAME
                 self.advance_state = False
@@ -379,12 +401,45 @@ class AFCFPSBuffer:
                 self.advance_state = False
                 self.trailing_state = False
 
+        # Update virtual filament sensors for GUI display
+        self._update_virtual_sensors(read_time)
+
     # ------------------------------------------------------------------
     # Correction timer — proportional adjustment loop
     # ------------------------------------------------------------------
+    def _update_virtual_sensors(self, eventtime):
+        """Push buffer state into virtual filament sensors for GUI display.
+
+        The advance sensor reports filament present whenever the FPS reads
+        above low_point (any meaningful pressure = filament exists in buffer).
+        This prevents the indicator from going red during neutral state when
+        filament IS loaded but pressure is balanced.
+        """
+        # Filament is present if FPS reads above the low threshold
+        filament_present = self.smoothed_fps > self.low_point
+        try:
+            if hasattr(self, 'fila_adv') and self.fila_adv is not None:
+                self.fila_adv.runout_helper.note_filament_present(
+                    eventtime, filament_present)
+        except TypeError:
+            self.fila_adv.runout_helper.note_filament_present(filament_present)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'fila_trail') and self.fila_trail is not None:
+                self.fila_trail.runout_helper.note_filament_present(
+                    eventtime, self.trailing_state)
+        except TypeError:
+            self.fila_trail.runout_helper.note_filament_present(self.trailing_state)
+        except Exception:
+            pass
+
     def _correction_event(self, eventtime):
         """Periodically adjust rotation distance based on FPS reading."""
         if not self.enable or self.current_lane is None:
+            return self.reactor.NEVER
+        # Non-stepper lanes (ACE/OpenAMS) don't need rotation correction
+        if getattr(self.current_lane, 'extruder_stepper', None) is None:
             return self.reactor.NEVER
 
         reading = self.smoothed_fps
@@ -447,20 +502,38 @@ class AFCFPSBuffer:
                 )
             )
 
+        self._update_virtual_sensors(eventtime)
         return eventtime + self.update_interval
 
     # ------------------------------------------------------------------
     # Buffer enable / disable  (interface expected by AFCLane)
     # ------------------------------------------------------------------
+    def enable_advance_latch(self):
+        """Enable latching so advance_state stays True once triggered.
+
+        Call before a load sequence. The latch prevents brief pressure
+        drops between ACE motor pulses from clearing the sensor state.
+        """
+        self._latch_enabled = True
+        self._advance_latched = False
+
+    def clear_advance_latch(self):
+        """Disable latching and reset advance_state to real-time pressure."""
+        self._latch_enabled = False
+        self._advance_latched = False
+
     def enable_buffer(self, lane):
         """Enable the FPS buffer for the given lane.
 
-        For stepper-based units (BoxTurtle, etc.) this starts the proportional
-        correction timer that adjusts rotation distance.  For non-stepper units
-        (OpenAMS) the correction loop is skipped — the FPS is used purely as an
-        ADC sensor and the oams_manager handles follower control directly.
+        For stepper-based units (BoxTurtle, etc.) this also starts the
+        proportional correction timer that adjusts rotation distance.
+        For non-stepper units (OpenAMS, ACE) the correction loop is skipped
+        but the buffer is still marked as enabled/active.
         """
         self.current_lane = lane
+        self.enable = True
+        self._latch_enabled = False
+        self._advance_latched = False
         has_stepper = getattr(lane, 'extruder_stepper', None) is not None
 
         if self.led:
@@ -470,7 +543,6 @@ class AFCFPSBuffer:
         self.smoothed_fps = self.fps_value
 
         if has_stepper:
-            self.enable = True
             # Start the proportional correction timer
             self.reactor.update_timer(self.correction_timer, self.reactor.NOW)
 
@@ -483,6 +555,8 @@ class AFCFPSBuffer:
     def disable_buffer(self):
         """Disable the FPS buffer, reset multiplier, stop timers."""
         self.enable = False
+        self._latch_enabled = False
+        self._advance_latched = False
         if self.current_lane is None:
             return
 
@@ -875,12 +949,18 @@ class VirtualFilamentSensor:
         self._object_name = f"filament_switch_sensor {name}"
         self.runout_helper = VirtualRunoutHelper(printer, name, runout_cb=runout_cb, enable_runout=enable_runout)
 
-        objects = getattr(printer, "objects", None)
-        if isinstance(objects, dict):
-            objects.setdefault(self._object_name, self)
+        try:
+            printer.add_object(self._object_name, self)
             if not show_in_gui:
-                hidden_key = "_" + self._object_name
-                objects[hidden_key] = objects.pop(self._object_name)
+                # Hide from GUI by prefixing with underscore
+                objects = getattr(printer, "objects", {})
+                if self._object_name in objects:
+                    objects["_" + self._object_name] = objects.pop(self._object_name)
+        except Exception:
+            # Fallback: direct dict registration
+            objects = getattr(printer, "objects", None)
+            if isinstance(objects, dict):
+                objects.setdefault(self._object_name, self)
 
         gcode = printer.lookup_object("gcode", None)
         if gcode is None:

@@ -64,6 +64,17 @@ def _make_toolchanger():
     tc.tool_names = []
     tc.error_message = ""
 
+    # Crash detection
+    tc.crash_detection_enabled = False
+    tc._crash_active = False
+    tc._crash_watchdog_timer = None
+    tc._crash_watchdog_errors = 0
+    tc._crash_enable_time = 0.0
+    tc._crash_watchdog_interval = 0.5
+    tc._crash_watchdog_threshold = 2
+    tc._crash_enable_grace = 2.0
+    tc.crash_mintime = 0.5
+
     tc.last_change_gcode_position = None
     tc.last_change_gcode_offset = None
     tc.last_change_restore_axis = None
@@ -564,21 +575,14 @@ class TestToolSwap:
         tc.tool_swap(lane)
         tc.afc.gcode.run_script_from_command.assert_any_call("MY_CUSTOM_SWAP")
 
-    def test_tool_swap_derives_tool_index_from_name(self):
-        """When tool_number is -1, derive index from extruder name."""
+    def test_tool_swap_errors_on_missing_tool_number(self):
+        """tool_number=-1 (not configured) should raise, not guess from name."""
         tc = self._make_swap_ready_tc()
         lane = _make_lane_for_swap("extruder3", tool_number=-1)
-        tc.tool_swap(lane)
-        tc.afc.gcode.run_script_from_command.assert_any_call(
-            'SELECT_TOOL T=3')
-
-    def test_tool_swap_base_extruder_index_zero(self):
-        """Base 'extruder' (no number) should resolve to T=0."""
-        tc = self._make_swap_ready_tc()
-        lane = _make_lane_for_swap("extruder", tool_number=-1)
-        tc.tool_swap(lane)
-        tc.afc.gcode.run_script_from_command.assert_any_call(
-            'SELECT_TOOL T=0')
+        with pytest.raises(Exception, match="no tool_number configured"):
+            tc.tool_swap(lane)
+        # State must still be reset to IDLE
+        assert tc.afc.current_state == State.IDLE
 
 
 # ── process_error ────────────────────────────────────────────────────────────

@@ -329,8 +329,8 @@ class AFCExtruder:
             if "unknown" == self.tool_start.lower():
                 raise error(f"Unknown is not valid for pin_tool_start in [{self.fullname}] config.")
 
-            if self.is_buffer:
-                self.logger.info(f"Setting up as buffer: {self.tool_start}")
+            if self.tool_start == "buffer":
+                self.logger.info("Setting up as buffer")
             else:
                 buttons.register_buttons([self.tool_start], self.tool_start_callback)
                 self.fila_tool_start, self.debounce_button_start = add_filament_switch(f"{self.name}_tool_start", self.tool_start, self.printer,
@@ -414,20 +414,11 @@ class AFCExtruder:
             #  set to current tool start state
             self.tc_lane._load_state = self.tc_lane.prep_state = self.tool_start_state
 
-            if self.is_buffer:
+            if self.tool_start == "buffer":
                 raise error(
                     f"buffer is not valid config for pin_tool_start when using {self.name} as a standalone extruder"
                 )
 
-
-    @property
-    def is_buffer(self):
-        """True when pin_tool_start uses a buffer for ramming (turtleneck or FPS)."""
-        if self.tool_start is None:
-            return False
-        if self.tool_start == "buffer":
-            return True
-        return str(self.tool_start).strip().upper().startswith("FPS_")
 
     def handle_connect(self):
         """
@@ -485,7 +476,7 @@ class AFCExtruder:
         # Resolve tool_probe for optotap/tool_probe setups
         if self.tool_number >= 0:
             self.tool_probe = self.printer.lookup_object(
-                'tool_probe T%d' % self.tool_number, None)
+                'AFC_tool_probe T%d' % self.tool_number, None)
 
         try:
             # Looking up led object if user supplied variable
@@ -543,6 +534,10 @@ class AFCExtruder:
 
         :param eventtime: Event time from the button press
         """
+        if not hasattr(self, 'fila_tool_start') or self.fila_tool_start is None:
+            # FPS buffer setups don't have fila_tool_start — runout is handled
+            # by the FPS/OpenAMS monitoring layer, not the filament switch.
+            return
         self._handle_toolhead_sensor_runout(self.fila_tool_start.runout_helper.filament_present, "tool_start")
         self.fila_tool_start.runout_helper.min_event_systime = self.reactor.monotonic() + self.fila_tool_start.runout_helper.event_delay
 
