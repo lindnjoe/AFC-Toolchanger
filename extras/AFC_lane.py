@@ -41,7 +41,7 @@ EXCLUDE_TYPES = ["HTLF", "ViViD"]
 # Names to exclude from search when trying to find unit name in config file
 # These are more for name that could be in config files
 INVALID_UNIT_NAMES = ["AFC_buffer", "AFC_button", "AFC_extruder",
-                      "AFC_hub", "AFC_lane", "AFC_led", "AFC_prep" "AFC_stepper"]
+                      "AFC_hub", "AFC_lane", "AFC_led", "AFC_prep", "AFC_stepper"]
 
 class AssistActive(Enum):
     YES = 1
@@ -319,7 +319,7 @@ class AFCLane:
             and "extruder" not in self.name): # Protects against standalone lanes
             self._get_extruder_object()
             pin = self.extruder_obj.tool_start
-            if "buffer" not in pin:
+            if pin not in ("buffer", "internal"):
                 self._set_homing_endstop(query_endstops, ppins,
                                          pin, AFCHomingPoints.TOOL)
 
@@ -606,6 +606,22 @@ class AFCLane:
         if add_to_other_obj:
             self.extruder_obj.lanes[self.name] = self
             self.extruder_obj.check_lanes()
+
+        # internal is only valid for units with their own filament engagement
+        # verification (currently only ACE). Toolchanger units are also
+        # allowed since they don't do filament loading themselves — the ACE
+        # unit handles load/unload for the shared extruder.
+        _INTERNAL_ALLOWED_TYPES = ("ACE", "Toolchanger")
+        if (self.extruder_obj.tool_start == "internal"
+            and self.unit_obj.type not in _INTERNAL_ALLOWED_TYPES):
+            raise error(
+                "pin_tool_start=internal on extruder {ext} is only supported "
+                "by ACE units, but lane {lane} belongs to a {ut} unit. Use "
+                "'buffer' with an [AFC_buffer]/[AFC_FPS] section, or set "
+                "pin_tool_start to a real sensor pin.".format(
+                    ext=self.extruder_obj.name, lane=self.name,
+                    ut=self.unit_obj.type)
+            )
 
         # Use buffer defined in stepper and override buffers that maybe set at the UNIT or extruder levels
         self.buffer_obj = self.unit_obj.buffer_obj
@@ -1555,6 +1571,9 @@ class AFCLane:
         """
         if self.extruder_obj.tool_start == "buffer" and self.buffer_obj is not None:
             return self.buffer_obj.advance_state
+        elif self.extruder_obj.tool_start == "internal":
+            # Unit firmware (e.g. ACE) handles tension — no AFC-visible sensor
+            return False
         else:
             return self.extruder_obj.tool_start_state
 
@@ -1567,6 +1586,9 @@ class AFCLane:
         """
         if self.extruder_obj.tool_start == "buffer":
             return self.buffer_endstop_name
+        elif self.extruder_obj.tool_start == "internal":
+            # No AFC-visible endstop — engagement is verified via unit firmware
+            return None
         else:
             return self.tool_endstop_name
 

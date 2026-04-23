@@ -273,6 +273,10 @@ class AFCExtruder:
         self.tool_number: int = config.getint('tool_number', -1)
         self.fan_name: Optional[str] = config.get('tool_fan', None)
         self.fan = None
+        self.dock_cooling: Optional[bool] = None
+        _dc = config.get('dock_cooling', None)
+        if _dc is not None:
+            self.dock_cooling = _dc.lower() in ('true', '1', 'yes')
         self.extruder_stepper_name: Optional[str] = config.get('tool_extruder_stepper', None)
         self.extruder_stepper = None
         self.detect_pin_name: Optional[str] = config.get('detection_pin', None)
@@ -331,6 +335,11 @@ class AFCExtruder:
 
             if self.tool_start == "buffer":
                 self.logger.info("Setting up as buffer")
+            elif self.tool_start == "internal":
+                self.logger.info(
+                    "Setting up as internal — relying on unit firmware "
+                    "(e.g. ACE) for filament engagement verification"
+                )
             else:
                 buttons.register_buttons([self.tool_start], self.tool_start_callback)
                 self.fila_tool_start, self.debounce_button_start = add_filament_switch(f"{self.name}_tool_start", self.tool_start, self.printer,
@@ -414,9 +423,9 @@ class AFCExtruder:
             #  set to current tool start state
             self.tc_lane._load_state = self.tc_lane.prep_state = self.tool_start_state
 
-            if self.tool_start == "buffer":
+            if self.tool_start in ("buffer", "internal"):
                 raise error(
-                    f"buffer is not valid config for pin_tool_start when using {self.name} as a standalone extruder"
+                    f"{self.tool_start} is not valid config for pin_tool_start when using {self.name} as a standalone extruder"
                 )
 
 

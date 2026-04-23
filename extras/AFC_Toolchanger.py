@@ -105,6 +105,21 @@ class AfcToolchanger(afcUnit):
         self._crash_active = False
         self._crash_watchdog_timer = None
         self._crash_watchdog_errors = 0
+
+        # Dock cooling — turns on part cooling fan for docked tools above
+        # a temperature threshold to prevent oozing while parked.
+        self.dock_cooling: bool = config.getboolean('dock_cooling', False)
+        self.dock_cooling_temp: float = config.getfloat('dock_cooling_temp', 170.0, minval=0.)
+        self.dock_cooling_fan_speed: float = config.getfloat('dock_cooling_fan_speed', 1.0, minval=0., maxval=1.0)
+        self._dock_cooled_tools: set = set()
+        # Always register the timer — per-tool dock_cooling overrides
+        # can enable cooling even when the global setting is off.
+        self._dock_cooling_timer = self.printer.get_reactor().register_timer(
+            self._dock_cooling_tick)
+        self.printer.register_event_handler("klippy:ready",
+            lambda: self.printer.get_reactor().update_timer(
+                self._dock_cooling_timer,
+                self.printer.get_reactor().NOW + 5.0))
         self._crash_enable_time = 0.0
 
         # Default gcode templates (can be overridden per-tool in AFC_extruder)
@@ -1019,6 +1034,77 @@ class AfcToolchanger(afcUnit):
     def cmd_STOP_TOOL_CRASH_DETECTION(self, gcmd):
         """Disable tool crash detection manually."""
         self.stop_crash_detection()
+
+    # ---- Dock cooling ----
+
+    def _dock_cooling_tick(self, eventtime):
+        """Periodic check to start/stop dock cooling fans based on temperature.
+
+        Uses fan object directly (not gcode) so it's safe from reactor context.
+        Per-tool dock_cooling overrides the global setting.
+        """
+        for tool in self.tools.values():
+            # Per-tool explicit False → skip.
+            # Per-tool None (unset) → fall back to global setting.
+            # Per-tool True → always cool this tool.
+            tool_dc = getattr(tool, 'dock_cooling', None)
+            if tool_dc is False:
+                continue
+            if tool_dc is None and not self.dock_cooling:
+                continue
+            # Active tool's fan is owned by FanSwitcher — don't touch it.
+            if tool == self.active_tool:
+                self._dock_cooled_tools.discard(tool.tool_number)
+                continue
+            try:
+                heater = self.printer.lookup_object(tool.name).get_heater()
+                current_temp, _ = heater.get_temp(eventtime)
+            except Exception:
+                continue
+            if current_temp >= self.dock_cooling_temp:
+                self._start_dock_cooling_fan_direct(tool, current_temp)
+            else:
+                self._stop_dock_cooling_fan_direct(tool, current_temp)
+
+        return eventtime + 5.0
+
+    def _start_dock_cooling_fan_direct(self, tool, current_temp):
+        """Start fan using fan object directly — safe from reactor context."""
+        if tool.tool_number in self._dock_cooled_tools:
+            return
+        fan_name = getattr(tool, 'fan_name', None)
+        if not fan_name:
+            return
+        try:
+            fan_obj = self.printer.lookup_object(
+                "fan_generic " + fan_name, None)
+            if fan_obj and hasattr(fan_obj, 'fan'):
+                fan_obj.fan.set_speed(self.dock_cooling_fan_speed)
+                self._dock_cooled_tools.add(tool.tool_number)
+                self.logger.info(
+                    "Dock cooling: %s fan on at %.0f%% (temp %.1fC >= %.1fC)"
+                    % (tool.name, self.dock_cooling_fan_speed * 100,
+                       current_temp, self.dock_cooling_temp))
+        except Exception:
+            pass
+
+    def _stop_dock_cooling_fan_direct(self, tool, current_temp):
+        """Stop fan using fan object directly — safe from reactor context."""
+        if tool.tool_number not in self._dock_cooled_tools:
+            return
+        self._dock_cooled_tools.discard(tool.tool_number)
+        try:
+            fan_name = getattr(tool, 'fan_name', None)
+            if fan_name:
+                fan_obj = self.printer.lookup_object(
+                    "fan_generic " + fan_name, None)
+                if fan_obj and hasattr(fan_obj, 'fan'):
+                    fan_obj.fan.set_speed(0.)
+                    self.logger.info(
+                        "Dock cooling: %s fan off (temp %.1fC < %.1fC)"
+                        % (tool.name, current_temp, self.dock_cooling_temp))
+        except Exception:
+            pass
 
     def _gcmd_tool(self, gcmd, default=None):
         """Resolve tool from TOOL= or T= gcode parameters."""

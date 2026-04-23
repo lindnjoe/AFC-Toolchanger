@@ -542,13 +542,25 @@ class afcFunction:
 
         cur_lane_loaded = self.get_current_lane_obj()
         self.logger.debug("Activating extruder lane: {}".format(cur_lane_loaded.name if cur_lane_loaded else "None"))
+        active_buffer_obj = getattr(cur_lane_loaded, "buffer_obj", None) if cur_lane_loaded is not None else None
+        active_buffer_name = getattr(cur_lane_loaded, "buffer_name", None) if cur_lane_loaded is not None else None
 
         self.afc.spool.set_active_spool('')
         # Disable extruder steppers for non active lanes
         for key, obj in self.afc.lanes.items():
             if cur_lane_loaded is None or key != cur_lane_loaded.name:
                 obj.do_enable(False)
-                obj.disable_buffer()
+                if (
+                    cur_lane_loaded is None
+                    or not (
+                        (active_buffer_obj is not None and getattr(obj, "buffer_obj", None) is active_buffer_obj)
+                        or (
+                            active_buffer_name is not None
+                            and getattr(obj, "buffer_name", None) == active_buffer_name
+                        )
+                    )
+                ):
+                    obj.disable_buffer()
                 if (cur_lane_loaded is None
                     or (obj.unit_obj.name != cur_lane_loaded.unit_obj.name)):
                     obj.unit_obj.return_to_home()
@@ -1339,7 +1351,7 @@ class afcFunction:
         # Determine if a specific lane is provided
         if lanes is not None:
             checked, calibrated, additional_msg = self._lane_calibration(lanes, unit, tol, dis)
-        else:
+        elif afc_bl is None and td1 is None:
             self.logger.info('No lanes selected to calibrate dist_hub')
 
         # Calibrate Bowden length with specified lane
@@ -1375,27 +1387,39 @@ class afcFunction:
         # Calibration for TD-1 bowden length
         if td1 is not None:
             title = "TD-1 Calibration"
-            td1_lane = self.afc.lanes[td1]
-            if (td1_lane.is_direct_hub()
-                and td1_lane.tool_loaded):
-                msg = f"{td1_lane.name} loaded to toolhead, unload from toolhead before "
-                msg += "trying to calibrate td1_bowden_length."
-                self.afc.error.AFC_error(msg, pause=False)
-                return
-            if td1_lane.hub_obj.state:
-                msg = f"{td1_lane.hub_obj.name} hub is triggered, make sure hub is clear before trying to calibrate TD-1 bowden length"
-                self.afc.error.AFC_error(msg, pause=False)
-                self.afc.gcode.run_script_from_command(f"AFC_CALI_FAIL TITLE='{title} Failed' FAIL={td1} DISTANCE=0 msg='{msg}' RESET=0")
+            # Support TD1=all — calibrate all lanes with td1_device_id
+            if td1.lower() == "all":
+                td1_lanes = [
+                    l for l in self.afc.lanes.values()
+                    if l.td1_device_id and l.load_state
+                    and (unit is None or l.unit == unit or getattr(l, 'unit', '').split(':')[0] == unit)
+                ]
+            elif td1 in self.afc.lanes:
+                td1_lanes = [self.afc.lanes[td1]]
+            else:
+                self.afc.error.AFC_error(f"Lane '{td1}' not found", pause=False)
                 return
 
-            checked, msg, pos = td1_lane.unit_obj.calibrate_td1( td1_lane, dis, tol)
-            if not checked:
-                fail_string = f"{td1} failed to calibrate TD-1 bowden length, {msg}"
-                self.afc.error.AFC_error(fail_string, pause=False)
-                self.afc.gcode.run_script_from_command(f"AFC_CALI_FAIL TITLE='{title} Failed' FAIL={td1} DISTANCE={pos} msg='{fail_string}' RESET=1")
-                return
-            else:
-                calibrated.append(f"'TD1_Bowden_length: {td1}'")
+            for td1_lane in td1_lanes:
+                if td1_lane.is_direct_hub() and td1_lane.tool_loaded:
+                    msg = f"{td1_lane.name} loaded to toolhead, skipping"
+                    self.logger.info(msg)
+                    continue
+                hub_obj = td1_lane.hub_obj
+                if hub_obj and hub_obj.switch_pin.lower() != "virtual" and hub_obj.state:
+                    msg = f"{hub_obj.name} hub triggered, skipping {td1_lane.name}"
+                    self.logger.info(msg)
+                    continue
+
+                checked, msg, pos = td1_lane.unit_obj.calibrate_td1(td1_lane, dis, tol)
+                if not checked:
+                    fail_string = f"{td1_lane.name} failed TD-1 calibration: {msg}"
+                    self.afc.error.AFC_error(fail_string, pause=False)
+                    self.afc.gcode.run_script_from_command(
+                        f"AFC_CALI_FAIL TITLE='{title} Failed' FAIL={td1_lane.name} DISTANCE={pos} msg='{fail_string}' RESET=1")
+                    return
+                else:
+                    calibrated.append(f"'TD1_Bowden_length: {td1_lane.name}'")
 
         if checked:
             lanes_calibrated = ', '.join(calibrated)

@@ -165,8 +165,9 @@ class AFCFPSBuffer:
         self.high_point: float = config.getfloat('high_point', 0.9, minval=0.5, maxval=1.0)
 
         # Multiplier range — how aggressively the buffer corrects
-        self.multiplier_high: float = config.getfloat('multiplier_high', 1.1, minval=1.0)
-        self.multiplier_low: float = config.getfloat('multiplier_low', 0.9, minval=0.0, maxval=1.0)
+        self.multiplier_high: float = config.getfloat('multiplier_high', 1.15, minval=1.0)
+        self.multiplier_low: float = config.getfloat('multiplier_low', 0.85, minval=0.0, maxval=1.0)
+        self.trailing_min_multiplier: float = config.getfloat('trailing_min_multiplier', 1.05, minval=1.0)
 
         # Deadband — total width of the neutral window centered on set_point
         # No correction applied when FPS is within this range.
@@ -205,6 +206,9 @@ class AFCFPSBuffer:
 
         # Timer interval for applying corrections
         self.update_interval: float = config.getfloat('update_interval', 0.25, minval=0.05)
+        self.flip_cooldown: float = config.getfloat('flip_cooldown', 180.0, minval=0.0)
+        self._flip_suppress_until: float = 0.0
+        self._last_correction_direction: str = NEUTRAL_STATE_NAME
 
         # ---- Fault detection ----
         self.error_sensitivity: float = config.getfloat('filament_error_sensitivity', 0, minval=0, maxval=10)
@@ -247,6 +251,12 @@ class AFCFPSBuffer:
 
         # ---- Correction timer ----
         self.correction_timer = self.reactor.register_timer(self._correction_event)
+        self._correction_running = False
+
+        # Track the last applied multiplier for the active lane so we can
+        # restore it on tool changes. Key: extruder name → (lane_name, multiplier)
+        self._last_multiplier = 1.0
+        self._saved_multipliers = {}
 
         # ---- Register event handlers ----
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
@@ -382,8 +392,14 @@ class AFCFPSBuffer:
         # filament arrival at the toolhead.
         # Update advance/trailing state for non-stepper lanes even when
         # buffer is enabled — the correction timer doesn't run for them.
-        has_stepper = (self.enable and self.current_lane is not None
-                       and getattr(self.current_lane, 'extruder_stepper', None) is not None)
+        has_stepper = self._lane_has_rotation_control(self.current_lane)
+
+        # If buffer was enabled before lane stepper wiring was ready,
+        # lazily start correction once the lane exposes rotation control.
+        if (self.enable and has_stepper
+                and not getattr(self, "_correction_running", False)):
+            self.reactor.update_timer(self.correction_timer, self.reactor.NOW)
+            self._correction_running = True
         if not has_stepper:
             half_db = self.deadband / 2.0
             if self.smoothed_fps > self.set_point + half_db:
@@ -439,63 +455,89 @@ class AFCFPSBuffer:
             pass
 
     def _correction_event(self, eventtime):
-        """Periodically adjust rotation distance based on FPS reading."""
+        """Periodically adjust rotation distance based on FPS reading.
+
+        Uses continuous proportional correction across the full range.
+        The further from set_point, the stronger the correction — no dead
+        zone where the buffer can sit uncorrected.
+        """
         if not self.enable or self.current_lane is None:
+            self._correction_running = False
             return self.reactor.NEVER
         # Non-stepper lanes (ACE/OpenAMS) don't need rotation correction
-        if getattr(self.current_lane, 'extruder_stepper', None) is None:
+        if not self._lane_has_rotation_control(self.current_lane):
+            self._correction_running = False
             return self.reactor.NEVER
 
         reading = self.smoothed_fps
-
+        deviation = reading - self.set_point  # positive = high/advancing, negative = low/trailing
         half_db = self.deadband / 2.0
-        neutral_low = self.set_point - half_db
-        neutral_high = self.set_point + half_db
 
-        # Inside deadband window (.35-.65 default) — no correction.
-        # Gives the buffer room for fast retractions and tool changes
-        # without the correction loop fighting back.
-        if neutral_low <= reading <= neutral_high:
-            self.set_multiplier(1.0)
-            self.last_state = NEUTRAL_STATE_NAME
-            self.advance_state = False
-            self.trailing_state = False
-            if self.led:
-                self.afc.function.afc_led(self.led_neutral, self.led_index)
-            return eventtime + self.update_interval
-
-        if reading > neutral_high:
-            # FPS reading is HIGH (buffer compressed / filament at toolhead)
-            # Need to slow down feeding → multiplier < 1
-            # Scale from 1.0 at neutral_high to multiplier_low at high_point
-            range_size = self.high_point - neutral_high
-            if range_size > 0:
-                fraction = min((reading - neutral_high) / range_size, 1.0)
-            else:
-                fraction = 1.0
+        # Continuous proportional multiplier:
+        #   Above set_point → slow down (multiplier < 1.0)
+        #   Below set_point → speed up (multiplier > 1.0)
+        #   At set_point    → neutral  (multiplier = 1.0)
+        # Full correction reached at the deadband edge (set_point ± half_db),
+        # clamped beyond that so the buffer reacts quickly.
+        if deviation > 0:
+            # High side: scale from 1.0 at set_point to multiplier_low at neutral_high
+            range_size = half_db if half_db > 0 else 0.01
+            fraction = min(deviation / range_size, 1.0)
             multiplier = 1.0 - fraction * (1.0 - self.multiplier_low)
+        elif deviation < 0:
+            # Low side: scale from 1.0 at set_point to multiplier_high at neutral_low
+            range_size = half_db if half_db > 0 else 0.01
+            fraction = min(-deviation / range_size, 1.0)
+            multiplier = 1.0 + fraction * (self.multiplier_high - 1.0)
+            trailing_floor = min(self.trailing_min_multiplier, self.multiplier_high)
+            multiplier = max(multiplier, trailing_floor)
+        else:
+            multiplier = 1.0
+
+        # Determine state for LED indication and fault reporting
+        half_db = self.deadband / 2.0
+        if reading > self.set_point + half_db:
+            target_direction = ADVANCING_STATE_NAME
+        elif reading < self.set_point - half_db:
+            target_direction = TRAILING_STATE_NAME
+        else:
+            target_direction = NEUTRAL_STATE_NAME
+
+        # Flip cooldown — suppress rapid direction changes
+        if (self._last_correction_direction in (ADVANCING_STATE_NAME, TRAILING_STATE_NAME)
+                and target_direction not in (NEUTRAL_STATE_NAME, self._last_correction_direction)):
+            self._flip_suppress_until = eventtime + self.flip_cooldown
+            self._last_correction_direction = NEUTRAL_STATE_NAME
+
+        if eventtime < self._flip_suppress_until:
+            multiplier = 1.0
+            target_direction = NEUTRAL_STATE_NAME
+
+        # Apply multiplier
+        self.set_multiplier(multiplier)
+
+        # Update state flags
+        if target_direction == ADVANCING_STATE_NAME:
             self.last_state = ADVANCING_STATE_NAME
             self.advance_state = True
             self.trailing_state = False
+            self._last_correction_direction = ADVANCING_STATE_NAME
             if self.led:
                 self.afc.function.afc_led(self.led_advancing, self.led_index)
-        else:
-            # FPS reading is LOW (buffer stretched / not feeding fast enough)
-            # Need to speed up feeding → multiplier > 1
-            # Scale from 1.0 at neutral_low to multiplier_high at low_point
-            range_size = neutral_low - self.low_point
-            if range_size > 0:
-                fraction = min((neutral_low - reading) / range_size, 1.0)
-            else:
-                fraction = 1.0
-            multiplier = 1.0 + fraction * (self.multiplier_high - 1.0)
+        elif target_direction == TRAILING_STATE_NAME:
             self.last_state = TRAILING_STATE_NAME
             self.advance_state = False
             self.trailing_state = True
+            self._last_correction_direction = TRAILING_STATE_NAME
             if self.led:
                 self.afc.function.afc_led(self.led_trailing, self.led_index)
-
-        self.set_multiplier(multiplier)
+        else:
+            self.last_state = NEUTRAL_STATE_NAME
+            self.advance_state = False
+            self.trailing_state = False
+            self._last_correction_direction = NEUTRAL_STATE_NAME
+            if self.led:
+                self.afc.function.afc_led(self.led_neutral, self.led_index)
 
         if self.debug:
             self.logger.debug(
@@ -505,6 +547,14 @@ class AFCFPSBuffer:
                     multiplier, self.last_state
                 )
             )
+
+        # Fault detection: update error position as long as correction is
+        # actively working (multiplier applied). Only stop updating when
+        # the reading is stuck at an extreme despite correction — that
+        # indicates a real clog or feed failure.
+        if self.fault_detection_enabled():
+            if reading <= self.high_point and reading >= self.low_point:
+                self.update_filament_error_pos()
 
         self._update_virtual_sensors(eventtime)
         return eventtime + self.update_interval
@@ -538,7 +588,9 @@ class AFCFPSBuffer:
         self.enable = True
         self._latch_enabled = False
         self._advance_latched = False
-        has_stepper = getattr(lane, 'extruder_stepper', None) is not None
+        self._flip_suppress_until = 0.0
+        self._last_correction_direction = NEUTRAL_STATE_NAME
+        has_stepper = self._lane_has_rotation_control(lane)
 
         if self.led:
             self.afc.function.afc_led(self.led_neutral, self.led_index)
@@ -547,12 +599,33 @@ class AFCFPSBuffer:
         self.smoothed_fps = self.fps_value
 
         if has_stepper:
+            # Restore the last multiplier for this extruder if the same lane
+            # is coming back (tool change with no spool swap). If a different
+            # lane is on this extruder, it's a new spool — start fresh at 1.0.
+            extruder_name = getattr(lane, 'extruder_name', None)
+            saved = self._saved_multipliers.get(extruder_name) if extruder_name else None
+            if saved is not None and saved[0] == lane.name and saved[1] != 1.0:
+                self.set_multiplier(saved[1])
+                self.logger.debug(
+                    f"{self.name} restored multiplier {saved[1]:.4f} "
+                    f"for {lane.name} on {extruder_name}"
+                )
+            else:
+                self._last_multiplier = 1.0
+
             # Start the proportional correction timer
             self.reactor.update_timer(self.correction_timer, self.reactor.NOW)
+            self._correction_running = True
 
-            # Start fault detection if configured
+            # Start fault detection — only for stepper lanes where the
+            # correction timer keeps extruder position in sync with buffer.
+            # Non-stepper lanes (ACE) have no correction, so extruder pos
+            # grows unbounded and falsely triggers the fault.
+            # OpenAMS has its own OAMSMonitor for fault detection.
             if self.fault_detection_enabled():
                 self.start_fault_detection(0, 1.0)
+        else:
+            self._correction_running = False
 
         self.logger.debug(f"{self.name} FPS buffer enabled for {self.current_lane.name} (correction={'active' if has_stepper else 'off/adc-only'})")
 
@@ -569,10 +642,24 @@ class AFCFPSBuffer:
         if self.led:
             self.afc.function.afc_led(self.led_buffer_disabled, self.led_index)
 
+        # Save the last multiplier for this extruder/lane so it can be
+        # restored on the next tool change back to this same lane.
+        if self._lane_has_rotation_control(self.current_lane):
+            extruder_name = getattr(self.current_lane, 'extruder_name', None)
+            if extruder_name:
+                self._saved_multipliers[extruder_name] = (
+                    self.current_lane.name, self._last_multiplier
+                )
+                self.logger.debug(
+                    f"{self.name} saved multiplier {self._last_multiplier:.4f} "
+                    f"for {self.current_lane.name} on {extruder_name}"
+                )
+
         self.reset_multiplier()
 
         # Stop correction timer
         self.reactor.update_timer(self.correction_timer, self.reactor.NEVER)
+        self._correction_running = False
 
         # Stop fault detection
         if self.error_sensitivity > 0 and self.extruder_pos_timer is not None:
@@ -590,20 +677,32 @@ class AFCFPSBuffer:
             return
         if self.current_lane is None:
             return
-        if self.current_lane.extruder_stepper is None:
+        if not self._lane_has_rotation_control(self.current_lane):
             return
 
+        self._last_multiplier = multiplier
         self.current_lane.update_rotation_distance(multiplier)
 
     def reset_multiplier(self):
         """Reset rotation distance back to base value."""
         if self.current_lane is None:
             return
-        if self.current_lane.extruder_stepper is None:
+        if not self._lane_has_rotation_control(self.current_lane):
             return
 
+        self._last_multiplier = 1.0
         self.current_lane.update_rotation_distance(1)
         self.logger.debug("FPS buffer multiplier reset for {}".format(self.current_lane.name))
+
+    def _lane_has_rotation_control(self, lane) -> bool:
+        """Return True when lane supports AFC stepper rotation adjustments."""
+        if lane is None:
+            return False
+        drive_stepper = getattr(lane, 'drive_stepper', None)
+        extruder_stepper = getattr(lane, 'extruder_stepper', None)
+        update_fn = getattr(lane, 'update_rotation_distance', None)
+        has_stepper = (drive_stepper is not None) or (extruder_stepper is not None)
+        return has_stepper and callable(update_fn)
 
     # ------------------------------------------------------------------
     # Fault detection  (same interface as AFCTrigger)
@@ -655,6 +754,8 @@ class AFCFPSBuffer:
 
     def extruder_pos_update_event(self, eventtime):
         cur_lane = self.current_lane
+        # Skip fault detection for non-stepper lanes — without the correction
+        # timer adjusting rotation distance, extruder pos grows unbounded.
         if cur_lane is not None and getattr(cur_lane, 'extruder_stepper', None) is None:
             return eventtime + CHECK_RUNOUT_TIMEOUT
 
@@ -670,6 +771,12 @@ class AFCFPSBuffer:
         if (self.afc.function.is_printing(check_movement=True)
                 and extruder_pos is not None
                 and self.filament_error_pos is not None):
+            # Update error position as long as FPS is within the
+            # correctable range (between low_point and high_point).
+            # Only let it expire when stuck at an extreme.
+            if self.low_point <= self.smoothed_fps <= self.high_point:
+                self.update_filament_error_pos()
+                return eventtime + CHECK_RUNOUT_TIMEOUT
             if extruder_pos > self.filament_error_pos:
                 msg = "AFC FPS buffer filament fault detected! Take necessary action."
                 self.pause_on_error(msg, True)
