@@ -1,24 +1,34 @@
 """
-Unit tests for extras/AFC_BoxTurtle.py
+Unit tests for extras/AFC_ACE.py
 
 Covers:
-  - afcBoxTurtle: MAX_NUM_MOVES constant
+  - afcACE: class constants, slot mapping, color conversion
+  - _get_local_slot_for_lane: maps lane index to 0-based slot
+  - _ace_color_to_hex: converts RGB array to hex string
+  - _get_feed_assist_for_slot: default vs override
   - system_Test: LED logic for each lane state combination
+  - _poll_slot_status: shifting state handling, operation guard, state consistency
+  - get_status: correct keys and content
+  - check_runout: returns True when printing
+  - get_lane_reset_command: returns TOOL_UNLOAD command
+  - lane_unload: blocks manual unload
+  - handle_connect: sets logo strings
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
-from extras.AFC_BoxTurtle import afcBoxTurtle
+from extras.AFC_ACE import afcACE, MODE_COMBINED, MODE_DIRECT
+from extras.AFC_lane import AFCLaneState
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_box_turtle(name="Turtle_1"):
-    """Build an afcBoxTurtle bypassing the complex __init__."""
-    unit = afcBoxTurtle.__new__(afcBoxTurtle)
+def _make_ace(name="ACE_1", mode=MODE_COMBINED):
+    """Build an afcACE bypassing the complex __init__."""
+    unit = afcACE.__new__(afcACE)
 
     from tests.conftest import MockAFC, MockPrinter, MockLogger, MockReactor
 
@@ -33,7 +43,7 @@ def _make_box_turtle(name="Turtle_1"):
     unit.logger = afc.logger
     unit.reactor = reactor
     unit.name = name
-    unit.full_name = ["AFC_BoxTurtle", name]
+    unit.full_name = ["AFC_ACE", name]
     unit.lanes = {}
     unit.hub_obj = None
     unit.extruder_obj = None
@@ -42,20 +52,73 @@ def _make_box_turtle(name="Turtle_1"):
     unit.extruder = None
     unit.buffer_name = None
     unit.td1_defined = False
-    unit.type = "Box_Turtle"
+    unit.type = "ACE"
     unit.gcode = afc.gcode
+    unit.mode = mode
+    unit.serial_port = "/dev/ttyACE0"
+    unit.feed_speed = 800.0
+    unit.retract_speed = 800.0
+    unit.feed_length = 500.0
+    unit.retract_length = 500.0
+    unit._default_feed_assist = True
+    unit._slot_feed_assist = {}
+    unit.extruder_assist_length = 50.0
+    unit.extruder_assist_speed = 300.0
+    unit.sensor_approach_margin = 60.0
+    unit.sensor_step = 20.0
+    unit.calibration_step = 50.0
+    unit.max_feed_overshoot = 100.0
+    unit.dock_purge = False
+    unit.dock_purge_length = 50.0
+    unit.dock_purge_speed = 5.0
+    unit.crash_detection_mode = "disabled"
+    unit.fps_threshold = 0.9
+    unit.fps_load_threshold = 0.65
+    unit.fps_delta_threshold = 0.15
+    unit.fps_confirm_count = 3
+    unit._prev_fps_value = 0.0
+    unit._fps_obj = None
+    unit._fps_extruder = None
+    unit._fps_runout_helper = None
+    unit._fps_latched = False
+    unit._fps_consecutive_hits = 0
+    unit.poll_interval = 1.0
+    unit.baud_rate = 115200
+    unit._ace = None
+    unit._slot_inventory = [{} for _ in range(4)]
+    unit._cached_hw_status = {}
+    unit._current_loaded_slot = -1
+    unit._prev_slot_states = {}
+    unit._prev_states_stale = False
+    unit._operation_active = False
+    unit._feed_assist_active = set()
+    unit._feed_assist_refresh_counter = 0
+    unit._FEED_ASSIST_REFRESH_INTERVAL = 7
+    unit._pending_feed_assist_restore = False
+    unit._drying_active = False
+    unit._persistence = MagicMock()
+    unit._last_inventory_sync = 0.0
+    unit._inventory_sync_interval = 300.0
+    unit._unit_load_to_hub = None
+    unit._hub_load_suppressed = set()
+    unit.auto_spoolman_create = True
+    unit._lane_auto_spoolman_create = {}
 
     return unit
 
 
-def _make_lane(prep_state=False, load_state=False, tool_loaded=False):
+def _make_lane(name="lane1", prep_state=False, load_state=False,
+               tool_loaded=False, index=1):
     lane = MagicMock()
-    lane.move = MagicMock()
-    lane.name = "lane1"
+    lane.name = name
     lane.prep_state = prep_state
     lane.load_state = load_state
     lane.tool_loaded = tool_loaded
     lane.map = "T0"
+    lane.index = index
+    lane.status = None
+    lane._afc_prep_done = True
+    lane.loaded_to_hub = False
     lane.led_ready = "0,1,0,0"
     lane.led_not_ready = "0,0,0,0.25"
     lane.led_fault = "1,0,0,0"
@@ -64,121 +127,420 @@ def _make_lane(prep_state=False, load_state=False, tool_loaded=False):
     lane.led_index = "1"
     lane.led_spool_index = "2"
     lane.led_use_filament_color = False
-    lane.status = None
     return lane
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
 class TestConstants:
-    def test_max_num_moves(self):
-        assert afcBoxTurtle.MAX_NUM_MOVES == 40
+    def test_slots_per_unit(self):
+        assert afcACE.SLOTS_PER_UNIT == 4
+
+    def test_mode_constants(self):
+        assert MODE_COMBINED == "combined"
+        assert MODE_DIRECT == "direct"
 
 
-# ── system_Test: empty lane (prep=F, load=F) ──────────────────────────────────
+# ── _get_local_slot_for_lane ──────────────────────────────────────────────────
+
+class TestGetLocalSlotForLane:
+    def test_returns_0_for_index_1(self):
+        unit = _make_ace()
+        lane = _make_lane(index=1)
+        assert unit._get_local_slot_for_lane(lane) == 0
+
+    def test_returns_3_for_index_4(self):
+        unit = _make_ace()
+        lane = _make_lane(index=4)
+        assert unit._get_local_slot_for_lane(lane) == 3
+
+    def test_returns_neg1_for_index_0(self):
+        unit = _make_ace()
+        lane = _make_lane(index=0)
+        assert unit._get_local_slot_for_lane(lane) == -1
+
+    def test_returns_neg1_for_index_5(self):
+        unit = _make_ace()
+        lane = _make_lane(index=5)
+        assert unit._get_local_slot_for_lane(lane) == -1
+
+
+# ── _ace_color_to_hex ────────────────────────────────────────────────────────
+
+class TestAceColorToHex:
+    def test_rgb_conversion(self):
+        assert afcACE._ace_color_to_hex([255, 128, 0]) == "#ff8000"
+
+    def test_black_for_zeros(self):
+        assert afcACE._ace_color_to_hex([0, 0, 0]) == "#000000"
+
+    def test_fallback_for_short_array(self):
+        assert afcACE._ace_color_to_hex([255]) == "#000000"
+
+    def test_fallback_for_non_list(self):
+        assert afcACE._ace_color_to_hex("red") == "#000000"
+
+    def test_tuple_input(self):
+        assert afcACE._ace_color_to_hex((128, 64, 32)) == "#804020"
+
+
+# ── _get_feed_assist_for_slot ────────────────────────────────────────────────
+
+class TestGetFeedAssistForSlot:
+    def test_returns_default_when_no_override(self):
+        unit = _make_ace()
+        unit._default_feed_assist = True
+        assert unit._get_feed_assist_for_slot(0) is True
+
+    def test_returns_override_when_set(self):
+        unit = _make_ace()
+        unit._default_feed_assist = True
+        unit._slot_feed_assist = {0: False}
+        assert unit._get_feed_assist_for_slot(0) is False
+
+    def test_returns_default_for_unoveridden_slot(self):
+        unit = _make_ace()
+        unit._default_feed_assist = False
+        unit._slot_feed_assist = {0: True}
+        assert unit._get_feed_assist_for_slot(1) is False
+
+
+# ── check_runout ─────────────────────────────────────────────────────────────
+
+class TestCheckRunout:
+    def test_returns_true_when_printing(self):
+        unit = _make_ace()
+        unit.afc.function.is_printing.return_value = True
+        assert unit.check_runout("lane1") is True
+
+    def test_returns_false_when_not_printing(self):
+        unit = _make_ace()
+        unit.afc.function.is_printing.return_value = False
+        assert unit.check_runout("lane1") is False
+
+    def test_returns_false_on_exception(self):
+        unit = _make_ace()
+        unit.afc.function.is_printing.side_effect = Exception("err")
+        assert unit.check_runout("lane1") is False
+
+
+# ── get_lane_reset_command ───────────────────────────────────────────────────
+
+class TestGetLaneResetCommand:
+    def test_returns_ace_lane_reset(self):
+        unit = _make_ace()
+        lane = _make_lane(name="lane3")
+        result = unit.get_lane_reset_command(lane, None)
+        assert result == "ACE_LANE_RESET UNIT=ACE_1 LANE=lane3"
+
+
+# ── lane_unload ──────────────────────────────────────────────────────────────
+
+class TestLaneUnload:
+    def test_returns_true(self):
+        """lane_unload returns True to prevent generic LANE_UNLOAD double-run."""
+        unit = _make_ace()
+        lane = _make_lane()
+        result = unit.lane_unload(lane)
+        assert result is True
+
+
+# ── get_status ───────────────────────────────────────────────────────────────
+
+class TestGetStatus:
+    def test_has_ace_mode_key(self):
+        unit = _make_ace()
+        status = unit.get_status()
+        assert "ace_mode" in status
+
+    def test_ace_mode_is_combined(self):
+        unit = _make_ace(mode=MODE_COMBINED)
+        status = unit.get_status()
+        assert status["ace_mode"] == MODE_COMBINED
+
+    def test_has_ace_connected_key(self):
+        unit = _make_ace()
+        status = unit.get_status()
+        assert "ace_connected" in status
+
+    def test_reports_not_connected_when_no_ace(self):
+        unit = _make_ace()
+        unit._ace = None
+        status = unit.get_status()
+        assert status["ace_connected"] is False
+
+    def test_has_ace_serial_port(self):
+        unit = _make_ace()
+        status = unit.get_status()
+        assert status["ace_serial_port"] == "/dev/ttyACE0"
+
+    def test_has_ace_status(self):
+        unit = _make_ace()
+        unit._cached_hw_status = {"temp": 25}
+        status = unit.get_status()
+        assert status["ace_status"] == {"temp": 25}
+
+
+# ── handle_connect ───────────────────────────────────────────────────────────
+
+class TestHandleConnect:
+    def test_sets_logo_with_mode(self):
+        unit = _make_ace(mode=MODE_COMBINED)
+        unit.set_logo_color = MagicMock()
+        unit._register_gcode_commands = MagicMock()
+        unit.handle_connect()
+        assert "combined" in unit.logo
+
+    def test_sets_logo_error(self):
+        unit = _make_ace()
+        unit.set_logo_color = MagicMock()
+        unit._register_gcode_commands = MagicMock()
+        unit.handle_connect()
+        assert "ERR" in unit.logo_error
+
+
+# ── system_Test: empty lane (prep=F, load=F) ────────────────────────────────
 
 class TestSystemTestEmptyLane:
-    def test_empty_lane_sets_not_ready_led(self):
-        """prep=False, load=False → LED set to led_not_ready."""
-        unit = _make_box_turtle()
+    def test_empty_lane_sets_not_ready(self):
+        unit = _make_ace()
         lane = _make_lane(prep_state=False, load_state=False)
         unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
         unit.afc.function.afc_led.assert_any_call(lane.led_not_ready, lane.led_index)
 
-    def test_empty_lane_does_not_set_fault_led(self):
-        unit = _make_box_turtle()
+    def test_empty_lane_returns_true(self):
+        unit = _make_ace()
         lane = _make_lane(prep_state=False, load_state=False)
-        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
-        for c in unit.afc.function.afc_led.call_args_list:
-            assert c[0][0] != lane.led_fault
+        result = unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        assert result is True
 
 
-# ── system_Test: fault lane (prep=F, load=T) ─────────────────────────────────
+# ── system_Test: fault lane (prep=F, load=T) ────────────────────────────────
 
 class TestSystemTestFaultLane:
     def test_fault_state_sets_fault_led(self):
-        """prep=False, load=True → LED set to led_fault."""
-        unit = _make_box_turtle()
+        unit = _make_ace()
         lane = _make_lane(prep_state=False, load_state=True)
         unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
         unit.afc.function.afc_led.assert_any_call(lane.led_fault, lane.led_index)
 
-    def test_fault_state_calls_do_enable_false(self):
-        """Faulted lane should disable stepper."""
-        unit = _make_box_turtle()
+    def test_fault_state_returns_false(self):
+        unit = _make_ace()
         lane = _make_lane(prep_state=False, load_state=True)
-        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
-        lane.do_enable.assert_called_with(False)
+        result = unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        assert result is False
 
 
-# ── system_Test: loaded (prep=T, load=T) ──────────────────────────────────────
+# ── system_Test: loaded (prep=T, load=T) ─────────────────────────────────────
 
 class TestSystemTestLoadedLane:
-    def test_loaded_sets_ready_led(self):
-        """prep=True, load=True → LED set to led_ready."""
-        unit = _make_box_turtle()
-        lane = _make_lane(prep_state=True, load_state=True)
-        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
-        unit.afc.function.afc_led.assert_any_call(lane.led_ready, lane.led_index)
-
     def test_loaded_sets_status_to_loaded(self):
-        from extras.AFC_lane import AFCLaneState
-        unit = _make_box_turtle()
+        unit = _make_ace()
         lane = _make_lane(prep_state=True, load_state=True)
         unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
         assert lane.status == AFCLaneState.LOADED
 
+    def test_tool_loaded_not_promoted_active_when_shuttle_empty(self):
+        unit = _make_ace()
+        lane = _make_lane(prep_state=True, load_state=True, tool_loaded=True)
+        lane.get_toolhead_pre_sensor_state.return_value = False
+        lane.extruder_obj = MagicMock()
+        lane.extruder_obj.tool_start = "buffer"
+        lane.extruder_obj.tool_end_state = False
+        lane.extruder_obj.on_shuttle.return_value = False
+        lane.extruder_obj.lane_loaded = lane.name
 
-# ── system_Test: locked not loaded (prep=T, load=F) ──────────────────────────
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+
+        assert lane.tool_loaded is True
+        assert lane.extruder_obj.lane_loaded == lane.name
+        unit.afc.spool.set_active_spool.assert_not_called()
+
+
+# ── system_Test: locked not loaded (prep=T, load=F) ─────────────────────────
 
 class TestSystemTestLockedNotLoaded:
-    def test_locked_not_loaded_sets_not_ready_led(self):
-        """prep=True, load=False → LED set to led_not_ready."""
-        unit = _make_box_turtle()
+    def test_returns_false(self):
+        unit = _make_ace()
         lane = _make_lane(prep_state=True, load_state=False)
-        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
-        unit.afc.function.afc_led.assert_any_call(lane.led_not_ready, lane.led_index)
-
-
-# ── system_Test: reactor pause called when no movement ───────────────────────
-
-class TestSystemTestReactorPause:
-    def test_reactor_pause_called_when_no_movement(self):
-        unit = _make_box_turtle()
-        lane = _make_lane()
-        pause_mock = MagicMock()
-        unit.afc.reactor.pause = pause_mock
-        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
-        pause_mock.assert_called()
-
-# ── _move_lane ──────────────────────────────────────────────────
-class Test_MoveLane:
-    def test_returns_not_enable_movement_loaded(self):
-        from unittest.mock import PropertyMock
-        unit = _make_box_turtle()
-        lane = _make_lane()
-        type(lane).load_state = PropertyMock(side_effect=[True])
-
-        result = unit._move_lane(lane, delay=1, enable_movement=False)
-        assert result is True
-    
-    def test_returns_not_enable_movement_not_loaded(self):
-        from unittest.mock import PropertyMock
-        unit = _make_box_turtle()
-        lane = _make_lane()
-        type(lane).load_state = PropertyMock(side_effect=[False])
-
-        result = unit._move_lane(lane, delay=1, enable_movement=False)
+        result = unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
         assert result is False
-    
-    def test_returns_enable_movement_not_loaded(self):
-        from unittest.mock import PropertyMock
-        unit = _make_box_turtle()
-        lane = _make_lane()
-        pause_mock = MagicMock()
-        unit.afc.reactor.pause = pause_mock
-        type(lane).load_state = PropertyMock(side_effect=[False])
 
-        result = unit._move_lane(lane, delay=1, enable_movement=True)
-        assert result is False
-        pause_mock.assert_called()
+
+# ── _set_hub_state ───────────────────────────────────────────────────────────
+
+class TestSetHubState:
+    def test_uses_switch_pin_callback_when_available(self):
+        unit = _make_ace()
+        lane = _make_lane()
+        hub = MagicMock()
+        lane.hub_obj = hub
+
+        unit._set_hub_state(lane, True)
+
+        hub.switch_pin_callback.assert_called_once_with(100.0, True)
+
+    def test_falls_back_to_state_for_direct_hub_callable(self):
+        unit = _make_ace()
+        lane = _make_lane()
+
+        def hub():
+            return None
+        hub.state = False
+        lane.hub_obj = hub
+
+        unit._set_hub_state(lane, True)
+
+        assert hub.state is True
+
+    def test_direct_hub_without_state_does_not_raise(self):
+        unit = _make_ace()
+        lane = _make_lane()
+
+        def hub():
+            return None
+
+        lane.hub_obj = hub
+        unit._set_hub_state(lane, True)
+
+
+class TestHubHasRealPin:
+    def test_returns_false_for_callable_direct_hub_placeholder(self):
+        unit = _make_ace()
+
+        def hub():
+            return None
+
+        assert unit._hub_has_real_pin(hub) is False
+
+    def test_returns_true_for_physical_hub_pin(self):
+        unit = _make_ace()
+        hub = MagicMock()
+        hub.switch_pin = "PA4"
+
+        assert unit._hub_has_real_pin(hub) is True
+
+
+# ── _poll_slot_status: shifting state handling ───────────────────────────────
+
+class TestPollSlotStatusShifting:
+    def test_shifting_does_not_update_prev_state(self):
+        unit = _make_ace()
+        lane = _make_lane()
+        unit.lanes = {"lane1": lane}
+        unit._prev_slot_states = {"lane1": True}
+        unit._slot_inventory = [{"status": "shifting"}, {}, {}, {}]
+
+        ace = MagicMock()
+        ace.connected = True
+        ace.get_status.return_value = {"slots": [{"status": "shifting"}]}
+        unit._ace = ace
+        unit.afc.function.is_printing.return_value = True
+
+        unit._poll_slot_status(100.0)
+
+        assert unit._prev_slot_states["lane1"] is True
+
+    def test_shifting_does_not_trigger_runout(self):
+        unit = _make_ace()
+        lane = _make_lane()
+        lane.status = AFCLaneState.TOOLED
+        unit.lanes = {"lane1": lane}
+        unit._prev_slot_states = {"lane1": True}
+        unit._slot_inventory = [{"status": "shifting"}, {}, {}, {}]
+
+        ace = MagicMock()
+        ace.connected = True
+        ace.get_status.return_value = {"slots": [{"status": "shifting"}]}
+        unit._ace = ace
+        unit.afc.function.is_printing.return_value = True
+
+        unit._poll_slot_status(100.0)
+
+        lane._perform_infinite_runout.assert_not_called()
+        lane._perform_pause_runout.assert_not_called()
+
+
+class TestPollSlotStatusOperationGuard:
+    def test_skips_when_operation_active(self):
+        unit = _make_ace()
+        unit._operation_active = True
+        unit._ace = MagicMock()
+        unit._ace.connected = True
+
+        result = unit._poll_slot_status(100.0)
+
+        assert result == 101.0  # eventtime + poll_interval
+
+
+class TestSyncRfidToSpoolman:
+    def test_matches_existing_filament_by_metadata_before_creating(self):
+        unit = _make_ace()
+        lane = _make_lane(name="lane1")
+        lane.spool_id = None
+        lane.send_lane_data = MagicMock()
+
+        unit.afc.spoolman = object()
+        unit.afc.spool = MagicMock()
+        unit.afc.moonraker = MagicMock()
+
+        # No direct SKU hit, but metadata match exists.
+        unit.afc.moonraker.search_filaments.side_effect = [
+            [],
+            [{
+                "id": 42,
+                "material": "PLA",
+                "vendor": {"name": "Bambu"},
+                "color_hex": "ff0000",
+                "diameter": 1.75,
+                "article_number": "OTHER-SKU",
+            }],
+        ]
+        unit.afc.moonraker.search_spools.return_value = []
+        unit.afc.moonraker.create_spool.return_value = {"id": 77}
+
+        slot_info = {
+            "sku": "SKU-123",
+            "brand": "Bambu",
+            "material": "PLA",
+            "color": [255, 0, 0],
+            "diameter": 1.75,
+            "total_weight": 190,
+        }
+
+        unit._sync_rfid_to_spoolman(lane, slot_info)
+
+        unit.afc.moonraker.create_filament.assert_not_called()
+        unit.afc.moonraker.create_spool.assert_called_once()
+        unit.afc.spool.set_spoolID.assert_called_once_with(lane, 77)
+
+    def test_creates_filament_when_no_metadata_match(self):
+        unit = _make_ace()
+        lane = _make_lane(name="lane1")
+        lane.spool_id = None
+        lane.send_lane_data = MagicMock()
+
+        unit.afc.spoolman = object()
+        unit.afc.spool = MagicMock()
+        unit.afc.moonraker = MagicMock()
+
+        unit.afc.moonraker.search_filaments.side_effect = [[], []]
+        unit.afc.moonraker.get_or_create_vendor.return_value = {"id": 7}
+        unit.afc.moonraker.create_filament.return_value = {"id": 88}
+        unit.afc.moonraker.search_spools.return_value = []
+        unit.afc.moonraker.create_spool.return_value = {"id": 99}
+
+        slot_info = {
+            "sku": "SKU-NEW",
+            "brand": "Bambu",
+            "material": "PETG",
+            "color": [0, 255, 0],
+            "diameter": 1.75,
+            "total_weight": 180,
+        }
+
+        unit._sync_rfid_to_spoolman(lane, slot_info)
+
+        unit.afc.moonraker.create_filament.assert_called_once()
+        unit.afc.moonraker.create_spool.assert_called_once()
+        unit.afc.spool.set_spoolID.assert_called_once_with(lane, 99)

@@ -1,377 +1,661 @@
 """
-Unit tests for extras/AFC.py
+Shared test fixtures and Klipper mock infrastructure for AFC unit tests.
 
-Covers:
-  - State: string constants
-  - AFC_VERSION: version string format
-  - afc._remove_after_last: string helper
-  - afc._get_message: message queue peek and pop
-  - afc.get_status: returns required keys
+All Klipper-specific modules (configfile, queuelogger, webhooks) are mocked
+here at the module level so that all test files can import AFC extras modules
+without a running Klipper instance.
 """
 
-from __future__ import annotations
+import configparser
+import logging
+import logging.handlers
+import os
+import pathlib
+import queue
+import sys
+import types
+from unittest.mock import MagicMock, patch  # noqa: F401
 
-from unittest.mock import MagicMock
 import pytest
 
-from extras.AFC import afc, State, AFC_VERSION
+# ── Path setup ────────────────────────────────────────────────────────────────
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
-# ── State constants ───────────────────────────────────────────────────────────
+# ── Klipper module mocks ──────────────────────────────────────────────────────
+# These must be installed before any extras.* imports happen.
 
-class TestStateConstants:
-    def test_init_value(self):
-        assert State.INIT == "Initialized"
+def _make_configfile_mock():
+    """Mock for Klipper's configfile module (not the PyPI configfile package)."""
+    mod = types.ModuleType("configfile")
 
-    def test_idle_value(self):
-        assert State.IDLE == "Idle"
+    class KlipperError(Exception):
+        """Klipper-style configuration error."""
 
-    def test_error_value(self):
-        assert State.ERROR == "Error"
+    class ConfigWrapper:
+        def __init__(self, printer=None, fileconfig=None, access_tracking=None, section=""):
+            self._printer = printer
+            self.fileconfig = fileconfig or configparser.RawConfigParser()
+            self._section = section
 
-    def test_loading_value(self):
-        assert State.LOADING == "Loading"
+        def get_printer(self):
+            return self._printer
 
-    def test_unloading_value(self):
-        assert State.UNLOADING == "Unloading"
+        def get_name(self):
+            return self._section
 
-    def test_ejecting_lane_value(self):
-        assert State.EJECTING_LANE == "Ejecting"
+        def get(self, option, default=None):
+            return default
 
-    def test_moving_lane_value(self):
-        assert State.MOVING_LANE == "Moving"
+        def getfloat(self, option, default=0.0, **kwargs):
+            return float(default)
 
-    def test_restoring_pos_value(self):
-        assert State.RESTORING_POS == "Restoring"
+        def getboolean(self, option, default=False, **kwargs):
+            return bool(default)
 
-    def test_all_constants_are_strings(self):
-        attrs = [a for a in dir(State) if not a.startswith("_")]
-        for attr in attrs:
-            assert isinstance(getattr(State, attr), str)
+        def getint(self, option, default=0, **kwargs):
+            return int(default)
 
-    def test_all_constants_unique(self):
-        attrs = [a for a in dir(State) if not a.startswith("_")]
-        values = [getattr(State, a) for a in attrs]
-        assert len(values) == len(set(values))
+        def getlist(self, option, default=None, **kwargs):
+            return default or []
 
+        def error(self, msg):
+            raise KlipperError(msg)
 
-# ── AFC_VERSION ───────────────────────────────────────────────────────────────
+        def deprecate(self, option):
+            pass
 
-class TestAfcVersion:
-    def test_version_is_string(self):
-        assert isinstance(AFC_VERSION, str)
-
-    def test_version_has_dots(self):
-        assert "." in AFC_VERSION
-
-    def test_version_parts_are_numeric(self):
-        parts = AFC_VERSION.split(".")
-        for part in parts:
-            assert part.isdigit(), f"Non-numeric version part: {part!r}"
+    mod.error = KlipperError
+    mod.ConfigWrapper = ConfigWrapper
+    return mod
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _make_queuelogger_mock():
+    """Mock for Klipper's queuelogger module."""
+    mod = types.ModuleType("queuelogger")
 
-def _make_afc():
-    """Build an afc instance bypassing __init__."""
-    obj = afc.__new__(afc)
+    class QueueListener:
+        def __init__(self, *args, **kwargs):
+            self.bg_queue = queue.Queue()
 
-    from tests.conftest import MockAFC, MockLogger, MockPrinter
+        def stop(self):
+            pass
 
-    inner = MockAFC()
-    printer = MockPrinter(afc=inner)
-    obj.printer = printer
-    obj.logger = MockLogger()
-    obj.reactor = inner.reactor
-    obj.moonraker = None
-    obj.function = MagicMock()
-    obj.message_queue = []
-    # obj.current = MagicMock()
-    obj.current_loading = None
-    obj.next_lane_load = None
-    obj.current_state = State.IDLE
-    obj.error_state = False
-    obj.position_saved = False
-    obj.spoolman = None
-    obj._td1_present = False
-    obj.lane_data_enabled = False
-    obj.units = {}
-    obj.lanes = {}
-    obj.tools = {}
-    obj.hubs = {}
-    obj.buffers = {}
-    obj.tool_cmds = {}
-    obj.led_state = True
-    obj.current_toolchange = 0
-    obj.number_of_toolchanges = 0
-    obj.temp_wait_tolerance = 5
-    obj._get_bypass_state = MagicMock(return_value=False)
-    obj._get_quiet_mode = MagicMock(return_value=False)
-    return obj
+        def setFormatter(self, fmt):
+            pass
+
+        def start(self):
+            pass
+
+    class QueueHandler(logging.Handler):
+        def __init__(self, q):
+            super().__init__()
+            self.queue = q
+
+        def emit(self, record):
+            pass
+
+    mod.QueueListener = QueueListener
+    mod.QueueHandler = QueueHandler
+    return mod
 
 
-# ── _remove_after_last ────────────────────────────────────────────────────────
+def _make_webhooks_mock():
+    """Mock for Klipper's webhooks module."""
+    mod = types.ModuleType("webhooks")
 
-class TestRemoveAfterLast:
-    def test_removes_after_last_slash(self):
-        obj = _make_afc()
-        result = obj._remove_after_last("/home/user/file.txt", "/")
-        assert result == "/home/user/"
+    class GCodeHelper:
+        pass
 
-    def test_no_char_returns_original(self):
-        obj = _make_afc()
-        result = obj._remove_after_last("nodots", ".")
-        assert result == "nodots"
-
-    def test_char_at_end(self):
-        obj = _make_afc()
-        result = obj._remove_after_last("trailing/", "/")
-        assert result == "trailing/"
-
-    def test_single_char_string(self):
-        obj = _make_afc()
-        result = obj._remove_after_last("/", "/")
-        assert result == "/"
-
-    def test_multiple_occurrences_uses_last(self):
-        obj = _make_afc()
-        result = obj._remove_after_last("a/b/c/d", "/")
-        assert result == "a/b/c/"
+    mod.GCodeHelper = GCodeHelper
+    return mod
 
 
-# ── _get_message ──────────────────────────────────────────────────────────────
+def _make_led_mock():
+    """Mock for extras.led (Klipper's shared LED helper module).
 
-class TestGetMessage:
-    def test_empty_queue_returns_empty_strings(self):
-        obj = _make_afc()
-        msg = obj._get_message()
-        assert msg["message"] == ""
-        assert msg["type"] == ""
-
-    def test_peek_does_not_remove(self):
-        obj = _make_afc()
-        obj.message_queue = [("hello", "info")]
-        obj._get_message(clear=False)
-        assert len(obj.message_queue) == 1
-
-    def test_peek_returns_message(self):
-        obj = _make_afc()
-        obj.message_queue = [("hello", "info")]
-        msg = obj._get_message(clear=False)
-        assert msg["message"] == "hello"
-        assert msg["type"] == "info"
-
-    def test_clear_removes_first_item(self):
-        obj = _make_afc()
-        obj.message_queue = [("first", "error"), ("second", "warning")]
-        obj._get_message(clear=True)
-        assert len(obj.message_queue) == 1
-        assert obj.message_queue[0][0] == "second"
-
-    def test_clear_returns_popped_message(self):
-        obj = _make_afc()
-        obj.message_queue = [("popped", "error")]
-        msg = obj._get_message(clear=True)
-        assert msg["message"] == "popped"
-        assert msg["type"] == "error"
-
-    def test_clear_on_empty_returns_empty(self):
-        obj = _make_afc()
-        msg = obj._get_message(clear=True)
-        assert msg["message"] == ""
-        assert msg["type"] == ""
-
-
-# ── get_status ────────────────────────────────────────────────────────────────
-
-class TestGetStatus:
-    def test_returns_required_keys(self):
-        obj = _make_afc()
-        status = obj.get_status()
-        required = {
-            "current_load", "current_state", "error_state",
-            "lanes", "extruders", "hubs", "buffers", "units",
-            "message", "position_saved",
-        }
-        for key in required:
-            assert key in status, f"Missing key: {key}"
-
-    def test_lanes_is_list(self):
-        obj = _make_afc()
-        assert isinstance(obj.get_status()["lanes"], list)
-
-    def test_extruders_is_list(self):
-        obj = _make_afc()
-        assert isinstance(obj.get_status()["extruders"], list)
-
-    def test_hubs_is_list(self):
-        obj = _make_afc()
-        assert isinstance(obj.get_status()["hubs"], list)
-
-    def test_units_is_list(self):
-        obj = _make_afc()
-        assert isinstance(obj.get_status()["units"], list)
-
-    def test_error_state_reflects_attribute(self):
-        obj = _make_afc()
-        obj.error_state = True
-        assert obj.get_status()["error_state"] is True
-
-    def test_current_load_none_when_nothing_loaded(self):
-        obj = _make_afc()
-        obj.function.get_current_lane.return_value = None
-        assert obj.get_status()["current_load"] is None
-
-    def test_message_from_queue(self):
-        obj = _make_afc()
-        obj.message_queue = [("test msg", "warning")]
-        msg = obj.get_status()["message"]
-        assert msg["message"] == "test msg"
-
-
-# ── _check_extruder_temp ──────────────────────────────────────────────────────
-
-def _make_afc_for_check_extruder_temp(
-    heater_target_temp,
-    actual_temp,
-    target_material_temp,
-    lower_extruder_temp_on_change=True,
-    using_min_value=False,
-):
-    from tests.test_AFC_lane import _make_afc_lane
-    """Build an afc instance wired up for _check_extruder_temp tests."""
-    obj = _make_afc()
-    obj.lower_extruder_temp_on_change = lower_extruder_temp_on_change
-    obj._wait_for_temp_within_tolerance = MagicMock()
-
-    heater = MagicMock()
-    heater.target_temp = heater_target_temp
-    heater.can_extrude = False
-    heater.get_temp = MagicMock(return_value=(actual_temp, 0.0))
-
-    extruder = MagicMock()
-    extruder.get_heater.return_value = heater
-
-    lane = _make_afc_lane()
-    lane.extruder_obj.toolhead_extruder = MagicMock()
-    lane.extruder_obj.toolhead_extruder = extruder
-
-    obj.toolhead = MagicMock()
-    obj.toolhead.get_extruder.return_value = extruder
-
-    pheaters = MagicMock()
-    obj.printer._objects["heaters"] = pheaters
-
-    obj.function.is_printing.return_value = False
-    obj._get_default_material_temps = MagicMock(
-        return_value=(float(target_material_temp), using_min_value)
-    )
-
-    return obj, heater, extruder, pheaters, lane
-
-
-class TestCheckExtruderTemp:
-    """Tests for afc._check_extruder_temp().
-
-    Covers the two-action logic:
-      need_lower: set temp > target+5 → lower without waiting
-      need_heat:  set temp < target-5 → heat and wait
-      skip_lower: need_lower AND lower_extruder_temp_on_change=False
-                  AND actual temp already sufficient → skip the lower call
+    AFC_led.py uses ``from . import led`` (relative import within the extras
+    package), which resolves to ``extras.led``.
     """
+    mod = types.ModuleType("extras.led")
 
-    # ── Default behaviour (lower_extruder_temp_on_change=True) ───────────────
+    class LEDHelper:
+        def __init__(self, config, update_func, chain_count):
+            self.led_count = chain_count
+            self._color_data = [(0.0, 0.0, 0.0, 0.0)] * chain_count
 
-    def test_lowers_to_target_when_above(self):
-        
-        """Set temp more than 5° above target → lower to target, no wait."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=250, actual_temp=248, target_material_temp=210
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is False
+        def get_status(self, eventtime=None):
+            return {"color_data": self._color_data}
 
-    def test_heats_to_target_when_below(self):
-        """Set temp more than 5° below target → heat to target and wait."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=150, actual_temp=148, target_material_temp=210
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
-        obj._wait_for_temp_within_tolerance.assert_called_once_with(obj.heater, 210,
-                                                                    obj.temp_wait_tolerance*2)
-        assert result is True
+        def _set_color(self, index, color):
+            pass
 
-    def test_no_change_when_within_range(self):
-        """Set temp within ±5° of target → no set_temperature call."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=212, actual_temp=210, target_material_temp=210
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_not_called()
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is False
+        def _check_transmit(self, print_time):
+            pass
 
-    def test_no_lower_when_using_min_extrude_temp(self):
-        """When using min_extrude_temp fallback, do not lower even if above target+5."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=250, actual_temp=248, target_material_temp=210,
-            using_min_value=True,
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_not_called()
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is False
+        def set_color(self, index, color):
+            pass
 
-    # ── lower_extruder_temp_on_change=False ──────────────────────────────────
+        def check_transmit(self, print_time):
+            pass
 
-    def test_skip_lower_when_disabled_and_actual_sufficient(self):
-        """lower=False, actual ≥ target-5 → lowering is skipped entirely."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=250, actual_temp=248, target_material_temp=210,
-            lower_extruder_temp_on_change=False,
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_not_called()
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is False
+    mod.LEDHelper = LEDHelper
+    return mod
 
-    def test_lower_not_skipped_when_actual_insufficient(self):
-        """lower=False but actual < target-5 → skip_lower stays False, lower fires."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=250, actual_temp=200, target_material_temp=210,
-            lower_extruder_temp_on_change=False,
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_any_call(heater, 210.0)
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is False
 
-    def test_heating_unaffected_by_lower_flag(self):
-        """lower=False does not suppress heating up to a higher target."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=150, actual_temp=148, target_material_temp=210,
-            lower_extruder_temp_on_change=False,
-        )
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
-        obj._wait_for_temp_within_tolerance.assert_called_once_with(obj.heater, 210,
-                                                                    obj.temp_wait_tolerance*2)
-        assert result is True
+# ── Additional Klipper C-extension mocks ─────────────────────────────────────
 
-    # ── Early-return guard ────────────────────────────────────────────────────
+def _make_chelper_mock():
+    """Mock for Klipper's chelper C extension."""
+    mod = types.ModuleType("chelper")
 
-    def test_no_change_when_printing(self):
-        """can_extrude=True + is_printing=True → early return, no temp change."""
-        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
-            heater_target_temp=150, actual_temp=148, target_material_temp=210
-        )
-        heater.can_extrude = True
-        obj.function.is_printing.return_value = True
-        result = obj._check_extruder_temp(lane)
-        pheaters.set_temperature.assert_not_called()
-        obj._wait_for_temp_within_tolerance.assert_not_called()
-        assert result is None
-    # TODO: add passing in a no_wait variable
+    def get_ffi():
+        ffi_main = MagicMock()
+        ffi_lib = MagicMock()
+        ffi_main.gc = lambda obj, free_fn: obj
+        return ffi_main, ffi_lib
+
+    mod.get_ffi = get_ffi
+    return mod
+
+
+def _make_kinematics_mocks():
+    """Mock for Klipper's kinematics package."""
+    kin_mod = types.ModuleType("kinematics")
+    ext_mod = types.ModuleType("kinematics.extruder")
+
+    class FakeExtruderStepper:
+        def __init__(self, config):
+            self.stepper = MagicMock()
+
+        def sync_to_extruder(self, name):
+            pass
+
+    ext_mod.ExtruderStepper = FakeExtruderStepper
+    kin_mod.extruder = ext_mod
+    return kin_mod, ext_mod
+
+
+def _make_force_move_mock():
+    """Mock for extras.force_move (used by AFC_stepper)."""
+    mod = types.ModuleType("extras.force_move")
+
+    def calc_move_time(dist, speed, accel):
+        # Returns axis_r, accel_t, cruise_t, cruise_v
+        return 1.0, 0.05, 0.1, speed
+
+    mod.calc_move_time = calc_move_time
+    return mod
+
+def _make_klippy_ready_mock():
+    mod = types.ModuleType("klippy")
+    mod.message_ready = "Printer is ready"
+    return mod
+
+
+def _make_afcace_serial_mock():
+    """Mock for AFC_ACE_serial (hardware serial communication)."""
+    mod = types.ModuleType("extras.AFC_ACE_serial")
+
+    class ACESerialError(Exception):
+        pass
+
+    class ACETimeoutError(ACESerialError):
+        pass
+
+    class ACEConnection:
+        def __init__(self, *args, **kwargs):
+            self.connected = False
+            self._callbacks = {}
+
+        def connect(self):
+            self.connected = True
+
+        def disconnect(self):
+            self.connected = False
+
+        def get_status(self, timeout=2.0):
+            return {"slots": []}
+
+        def start_feed_assist(self, slot):
+            pass
+
+        def stop_feed_assist(self, slot):
+            pass
+
+        def feed_filament(self, slot, length, speed=None):
+            pass
+
+        def retract_filament(self, slot, length, speed=None):
+            pass
+
+        def get_filament_info(self, slot):
+            return {}
+
+        def set_status_callback(self, cb):
+            pass
+
+    mod.ACEConnection = ACEConnection
+    mod.ACESerialError = ACESerialError
+    mod.ACETimeoutError = ACETimeoutError
+    return mod
+
+
+def _make_temperature_ace_mock():
+    """Mock for extras.temperature_ace."""
+    mod = types.ModuleType("extras.temperature_ace")
+
+    class TemperatureACE:
+        def __init__(self, config):
+            pass
+
+    mod.TemperatureACE = TemperatureACE
+    return mod
+
+
+# Install mocks before any extras imports happen
+sys.modules.setdefault("configfile", _make_configfile_mock())
+sys.modules.setdefault("queuelogger", _make_queuelogger_mock())
+sys.modules.setdefault("webhooks", _make_webhooks_mock())
+
+# C-extension / Klipper internals mocks
+sys.modules.setdefault("chelper", _make_chelper_mock())
+_kin_mod, _kin_ext_mod = _make_kinematics_mocks()
+sys.modules.setdefault("kinematics", _kin_mod)
+sys.modules.setdefault("kinematics.extruder", _kin_ext_mod)
+sys.modules.setdefault("extras.force_move", _make_force_move_mock())
+sys.modules.setdefault("klippy", _make_klippy_ready_mock())
+
+# ACE/OpenAMS-specific mocks
+sys.modules.setdefault("extras.AFC_ACE_serial", _make_afcace_serial_mock())
+sys.modules.setdefault("extras.temperature_ace", _make_temperature_ace_mock())
+
+_led_mock = _make_led_mock()
+sys.modules.setdefault("extras.led", _led_mock)
+
+# Attach the led mock as an attribute on the extras package after it's loaded
+try:
+    import extras  # noqa: E402 (intentionally after sys.modules manipulation)
+    if not hasattr(extras, "led"):
+        extras.led = _led_mock
+except ImportError:
+    pass
+
+
+# ── Reusable helper ───────────────────────────────────────────────────────────
+
+def _make_fileconfig(*sections):
+    """Return a RawConfigParser pre-populated with the given sections."""
+    raw = configparser.RawConfigParser()
+    for section in sections:
+        raw.add_section(section)
+    return raw
+
+
+# ── Mock building blocks ──────────────────────────────────────────────────────
+
+class MockReactor:
+    NEVER = 9_999_999_999.0
+    NOW = 0.0
+
+    def __init__(self, monotonic_value=100.0):
+        self._monotonic = monotonic_value
+
+    def monotonic(self):
+        return self._monotonic
+    
+    def pause(self, until):
+        pass
+
+    def mutex(self, is_locked=False):
+        return MagicMock()
+
+    def register_timer(self, callback, waketime=None):
+        return MagicMock()
+
+    def update_timer(self, timer, waketime):
+        pass
+
+    def register_callback(self, callback, waketime=None):
+        pass
+
+    def unregister_timer(self, timer):
+        pass
+
+
+class MockGcodeError(Exception):
+    """Gcode error type used by MockGcode.error()."""
+    pass
+
+
+class MockGcode:
+    error = MockGcodeError
+
+    def __init__(self):
+        self.output_callbacks = []
+        self._commands = {}
+        # Use MagicMock so tests can assert call counts / args
+        self.run_script_from_command = MagicMock()
+
+    def register_command(self, name, func, desc=None):
+        self._commands[name] = func
+
+    def register_mux_command(self, cmd, key, value, func, desc=None):
+        pass
+
+    def respond_info(self, msg):
+        pass
+
+    def respond_raw(self, msg):
+        pass
+
+    def create_gcode_command(self, command, commandline, params):
+        gcmd = MagicMock()
+        gcmd.get_commandline.return_value = commandline
+        return gcmd
+
+
+class MockLogger:
+    """Lightweight stand-in for AFC_logger.AFC_logger."""
+
+    def __init__(self):
+        self.messages: list = []
+
+    def info(self, msg, **kwargs):
+        self.messages.append(("info", msg))
+
+    def warning(self, msg, **kwargs):
+        self.messages.append(("warning", msg))
+
+    def debug(self, msg, **kwargs):
+        self.messages.append(("debug", msg))
+
+    def error(self, msg=None, **kwargs):
+        # AFC_logger.error() can be called as error(msg) or error(message=msg, ...)
+        message = msg if msg is not None else kwargs.get("message", "")
+        self.messages.append(("error", message))
+
+    def raw(self, msg, **kwargs):
+        self.messages.append(("raw", msg))
+
+    def set_debug(self, val):
+        pass
+
+
+class MockMoonraker:
+    """Minimal AFC_moonraker stand-in for unit tests."""
+
+    def __init__(self):
+        self.logger = MockLogger()
+        self._stats: dict = {}
+        self.afc_stats_key = "afc_stats"
+
+    def get_afc_stats(self):
+        return self._stats or None
+
+    def update_afc_stats(self, key, value):
+        self._stats[key] = value
+
+    def remove_database_entry(self, namespace, key):
+        pass
+
+
+class MockAFC:
+    """Mock for the main afc object that most extras modules depend on."""
+
+    def __init__(self):
+        self.logger = MockLogger()
+        self.reactor = MockReactor()
+        self.gcode = MockGcode()
+        self.error_state = False
+        self.current_state = "Idle"
+        self.hubs: dict = {}
+        self.lanes: dict = {}
+        self.tools: dict = {}
+        self.units: dict = {}
+        self.buffers: dict = {}
+        self.led_obj: dict = {}
+        self.current = None
+        self.enable_sensors_in_gui = False
+        self.debounce_delay = 0.1
+        self.enable_hub_runout = False
+        self.show_macros = True
+        self.message_queue: list = []
+        self.log_frame_data = True
+        self.position_saved = False
+        self.in_toolchange = False
+        self.error_timeout = 600
+        self.td1_defined = False
+        self.td1_present = False
+        self.moonraker = MockMoonraker()
+        self.function = MagicMock()
+        self.error = MagicMock()
+        self.spool = MagicMock()
+        self.short_moves_speed = 50.0
+        self.short_moves_accel = 400.0
+        self.long_moves_speed = 100.0
+        self.long_moves_accel = 400.0
+        self.z_hop = 0.5
+        self.last_gcode_position = [0.0, 0.0, 0.0, 0.0]
+        self.gcode_move = MagicMock()
+        self.prep_done = False
+        self.spoolman = None
+        self.disable_weight_check = False
+        self.ignore_spoolman_material_temps = False
+        self.default_material_type = "PLA"
+        self.bypass = MagicMock()
+        self.save_vars = MagicMock()
+        self.tool_cmds: dict = {}
+        self.VarFile = "/tmp/afc_test_vars"
+        # LED colour defaults
+        self.led_fault = "1,0,0,0"
+        self.led_ready = "0,1,0,0"
+        self.led_not_ready = "0,0,0,0.25"
+        self.led_loading = "0,0,1,0"
+        self.led_unloading = "0,0,1,0"
+        self.led_tool_loaded = "0,1,0,0"
+        self.led_spool_illum = "1,1,1,0"
+        self.led_off = "0,0,0,0"
+        # function mock helpers
+        self.function.HexConvert = lambda x: x
+
+
+class MockPrinter:
+    """Mock for Klipper's printer object."""
+    command_error = Exception
+    def __init__(self, afc=None):
+        self._afc = afc or MockAFC()
+        self._reactor = MockReactor()
+        self.reactor = self._reactor  # AFC_logger accesses printer.reactor directly
+        self._gcode = MockGcode()
+        self._objects: dict = {}
+        self.state_message = "Printer is ready"
+        self.start_args: dict = {}
+        self.objects: dict = {}
+        self._event_handlers: dict = {}
+
+    # ------------------------------------------------------------------
+    def lookup_object(self, name, default=None):
+        mapping = {
+            "AFC": self._afc,
+            "gcode": self._gcode,
+        }
+        if name in mapping:
+            return mapping[name]
+        if name in self._objects:
+            return self._objects[name]
+        if name == "webhooks":
+            return MagicMock()
+        if name == "pause_resume":
+            obj = MagicMock()
+            obj.send_pause_command = MagicMock()
+            return obj
+        if name == "idle_timeout":
+            obj = MagicMock()
+            obj.idle_timeout = 600
+            return obj
+        if name == "toolhead":
+            return MagicMock()
+        if name == "heaters":
+            return MagicMock()
+        if name == "pins":
+            return MagicMock()
+        if name == "buttons":
+            return MagicMock()
+        return default
+
+    def load_object(self, config, name):
+        result = self.lookup_object(name)
+        if result is None:
+            result = MagicMock()
+        return result
+
+    def get_reactor(self):
+        return self._reactor
+
+    def register_event_handler(self, event, callback):
+        self._event_handlers.setdefault(event, []).append(callback)
+
+    def send_event(self, event, *args):
+        for handler in self._event_handlers.get(event, []):
+            handler(*args)
+
+    def get_start_args(self):
+        return self.start_args
+
+
+class MockConfig:
+    """Mock for Klipper's ConfigWrapper, used to construct extras objects."""
+
+    def __init__(self, name="test_section", printer=None, values=None):
+        self._name = name
+        self._printer = printer or MockPrinter()
+        self._values: dict = values or {}
+        self.fileconfig = _make_fileconfig()
+
+    def get_printer(self):
+        return self._printer
+
+    def get_name(self):
+        return self._name
+
+    def get(self, option, default=None):
+        return self._values.get(option, default)
+
+    def getfloat(self, option, default=0.0, **kwargs):
+        val = self._values.get(option, default)
+        if val is None:
+            return None
+        return float(val)
+
+    def getboolean(self, option, default=False, **kwargs):
+        val = self._values.get(option, default)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() in ("true", "1", "yes")
+        return bool(val)
+
+    def getint(self, option, default=0, **kwargs):
+        val = self._values.get(option, default)
+        return int(val)
+
+    def getlist(self, option, default=None, **kwargs):
+        val = self._values.get(option, default)
+        return val if val is not None else []
+
+    def error(self, msg):
+        from configfile import error as KlipperError
+        raise KlipperError(msg)
+
+    def deprecate(self, option):
+        pass
+
+
+# ── pytest fixtures ───────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mock_reactor():
+    return MockReactor()
+
+
+@pytest.fixture
+def mock_gcode():
+    return MockGcode()
+
+
+@pytest.fixture
+def mock_logger():
+    return MockLogger()
+
+
+@pytest.fixture
+def mock_moonraker():
+    return MockMoonraker()
+
+
+@pytest.fixture
+def mock_afc():
+    return MockAFC()
+
+
+@pytest.fixture
+def mock_printer(mock_afc):
+    return MockPrinter(afc=mock_afc)
+
+
+@pytest.fixture
+def mock_config(mock_printer):
+    return MockConfig(printer=mock_printer)
+
+
+# ── Klippy integration-test session hooks ─────────────────────────────────────
+# Sets up the Klipper environment by symlinking AFC extras and the testing
+# plugin into the cloned Klipper tree before any .test files are collected.
+
+_ROOT = pathlib.Path(__file__).parent.parent
+_KLIPPER_PATH = pathlib.Path(os.environ.get("KLIPPER_PATH", str(_ROOT / "klipper")))
+_AFC_EXTRAS = _ROOT / "extras"
+_TESTING_PLUGIN_SRC = _ROOT / "tests" / "klippy_testing_plugin.py"
+
+
+def pytest_sessionstart(session):
+    """Link AFC extras and the testing plugin into Klipper for integration tests."""
+    if not _KLIPPER_PATH.exists():
+        return  # Klipper not cloned yet — klippy tests will be skipped
+
+    klippy_dir = _KLIPPER_PATH / "klippy"
+    if not klippy_dir.exists():
+        return
+
+    klippy_extras = klippy_dir / "extras"
+    linked: list[pathlib.Path] = []
+
+    # Symlink each AFC_*.py module into Klipper's extras directory so that
+    # "from extras.AFC_xxx import ..." resolves correctly inside klippy.
+    if klippy_extras.exists():
+        for src in sorted(_AFC_EXTRAS.glob("AFC*.py")):
+            dst = klippy_extras / src.name
+            if not dst.exists():
+                os.symlink(src.resolve(), dst)
+                linked.append(dst)
+
+    # Symlink the testing plugin (provides the ASSERT gcode command) into
+    # Klipper's extras directory so it loads when [testing] appears in a config.
+    plugin_link = klippy_extras / "testing.py"
+    if not plugin_link.exists() and _TESTING_PLUGIN_SRC.exists():
+        os.symlink(_TESTING_PLUGIN_SRC.resolve(), plugin_link)
+        linked.append(plugin_link)
+
+    session._afc_klippy_links = linked
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remove symlinks created during the test session."""
+    for link in getattr(session, "_afc_klippy_links", []):
+        try:
+            link.unlink()
+        except FileNotFoundError:
+            pass

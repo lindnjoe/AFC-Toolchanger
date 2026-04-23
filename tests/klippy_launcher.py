@@ -1,16 +1,13 @@
 
-# Minimal Klipper + AFC configuration with one BoxTurtle unit, one lane, and
-# one TurtleNeck-style AFC_buffer.
+# Minimal Klipper + AFC configuration with one BoxTurtle unit and lane.
+# Extends the base configuration by adding a simulated AFC_BoxTurtle unit,
+# one AFC_stepper lane, and one AFC_hub — all using free STM32H723 pins
+# not consumed by the base printer kinematics (PA*/PB* are already used).
 #
-# Pin assignment summary:
-#   PA0–PA7  stepper_x + stepper_y (step/dir/enable/endstop)
-#   PB0–PB8  stepper_z + extruder + heater_bed
-#   PC0–PC5  AFC lane + hub switch  (from afc_with_lane.cfg)
-#   PC6      AFC_buffer buf1 advance (expanded) pin
-#   PC7      AFC_buffer buf1 trailing (compressed) pin
+# Free pin bank used here: PC0–PC5
 #
-# This file is self-contained — it duplicates the printer/AFC base so that
-# klippy can load it standalone without an include directive.
+# This file duplicates the base printer/AFC config so that klippy can load it
+# as a standalone config without needing an include directive.
 
 # ---------------------------------------------------------------------------
 # MCU — path is irrelevant in dict/simulation mode
@@ -89,7 +86,7 @@ pid_Kd: 948.182
 
 # save_variables is required by AFC to persist spool/lane state.
 [save_variables]
-filename: /tmp/afc_klippy_buffer_test.cfg
+filename: /tmp/afc_klippy_lane_test.cfg
 
 # pause_resume is required by AFC_error
 [pause_resume]
@@ -101,7 +98,7 @@ filename: /tmp/afc_klippy_buffer_test.cfg
 [testing]
 
 [AFC]
-VarFile: /tmp/afc_klippy_buffer_test.var
+VarFile: /tmp/afc_klippy_lane_test.var
 long_moves_speed: 150
 long_moves_accel: 250
 short_moves_speed: 50
@@ -129,15 +126,16 @@ cooling_tube_length: 10
 cooling_moves: 4
 
 # ---------------------------------------------------------------------------
-# One BoxTurtle unit with a single lane — uses PC0–PC5
+# One BoxTurtle unit with a single lane — uses PC0–PC5 (all free)
 # ---------------------------------------------------------------------------
 
+# AFC extruder wrapper (required so AFC_stepper can link to an extruder object)
 [AFC_extruder extruder]
+# No tool_start / tool_end sensor pins — keep config minimal.
 
 [AFC_BoxTurtle unit_1]
 hub: hub_1
 extruder: extruder
-buffer: buf1
 
 [AFC_hub hub_1]
 switch_pin: PC5
@@ -156,13 +154,3 @@ dist_hub: 155.0
 park_dist: 10
 prep: PC3
 load: PC4
-
-# ---------------------------------------------------------------------------
-# TurtleNeck-style buffer — uses PC6 (advance/expanded) and PC7 (trailing/compressed)
-# ---------------------------------------------------------------------------
-
-[AFC_buffer buf1]
-advance_pin: PC6
-trailing_pin: PC7
-multiplier_high: 1.05
-multiplier_low: 0.95

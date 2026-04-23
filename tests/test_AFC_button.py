@@ -1,232 +1,184 @@
 """
-Unit tests for extras/AFC_button.py
+Unit tests for extras/AFC_BoxTurtle.py
 
 Covers:
-  - AFCButton._button_callback: press/release tracking, short/long press logic
-  - AFCButton._handle_ready: validates lane_obj lookup
-  - Integration: correct actions taken for short vs long press
+  - afcBoxTurtle: MAX_NUM_MOVES constant
+  - system_Test: LED logic for each lane state combination
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 
-from extras.AFC_button import AFCButton
+from extras.AFC_BoxTurtle import afcBoxTurtle
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_button(lane_id="lane1", long_press_duration=1.2):
-    """Build an AFCButton bypassing __init__."""
-    btn = AFCButton.__new__(AFCButton)
+def _make_box_turtle(name="Turtle_1"):
+    """Build an afcBoxTurtle bypassing the complex __init__."""
+    unit = afcBoxTurtle.__new__(afcBoxTurtle)
 
-    from tests.conftest import MockAFC, MockPrinter, MockReactor, MockLogger
+    from tests.conftest import MockAFC, MockPrinter, MockLogger, MockReactor
 
     afc = MockAFC()
-    afc.logger = MockLogger()
     reactor = MockReactor()
+    afc.reactor = reactor
+    afc.logger = MockLogger()
     printer = MockPrinter(afc=afc)
-    printer._reactor = reactor
 
-    btn.printer = printer
-    btn.gcode = printer._gcode
-    btn.reactor = reactor
-    btn.afc = afc
-    btn.lane_id = lane_id
-    btn.lane_obj = None
-    btn.long_press_duration = long_press_duration
-    btn._press_time = None
+    unit.printer = printer
+    unit.afc = afc
+    unit.logger = afc.logger
+    unit.reactor = reactor
+    unit.name = name
+    unit.full_name = ["AFC_BoxTurtle", name]
+    unit.lanes = {}
+    unit.hub_obj = None
+    unit.extruder_obj = None
+    unit.buffer_obj = None
+    unit.hub = None
+    unit.extruder = None
+    unit.buffer_name = None
+    unit.td1_defined = False
+    unit.type = "Box_Turtle"
+    unit.gcode = afc.gcode
 
-    # Set up a lane object
+    return unit
+
+
+def _make_lane(prep_state=False, load_state=False, tool_loaded=False):
     lane = MagicMock()
-    lane.name = lane_id
-    afc.lanes = {lane_id: lane}
-    btn.lane_obj = lane
-
-    return btn
-
-
-# ── _handle_ready ─────────────────────────────────────────────────────────────
-
-class TestHandleReady:
-    def test_handle_ready_sets_lane_obj_when_found(self):
-        btn = _make_button("lane1")
-        btn.lane_obj = None
-        btn._handle_ready()
-        assert btn.lane_obj is btn.afc.lanes["lane1"]
-
-    def test_handle_ready_raises_when_lane_not_found(self):
-        btn = _make_button("missing_lane")
-        btn.afc.lanes = {}  # No lanes defined
-        btn.lane_obj = None
-        from configfile import error as KlipperError
-        with pytest.raises(KlipperError):
-            btn._handle_ready()
+    lane.move = MagicMock()
+    lane.name = "lane1"
+    lane.prep_state = prep_state
+    lane.load_state = load_state
+    lane.tool_loaded = tool_loaded
+    lane.map = "T0"
+    lane.led_ready = "0,1,0,0"
+    lane.led_not_ready = "0,0,0,0.25"
+    lane.led_fault = "1,0,0,0"
+    lane.led_loading = "0,0,1,0"
+    lane.led_spool_illum = "1,1,1,0"
+    lane.led_index = "1"
+    lane.led_spool_index = "2"
+    lane.led_use_filament_color = False
+    lane.status = None
+    return lane
 
 
-# ── _button_callback – state tracking ────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
-class TestButtonCallbackStateTracking:
-    def test_press_stores_time(self):
-        btn = _make_button()
-        btn._button_callback(100.0, True)
-        assert btn._press_time == 100.0
-
-    def test_release_with_no_press_does_nothing(self):
-        btn = _make_button()
-        btn._press_time = None
-        btn.afc.error = MagicMock()
-        btn._button_callback(101.0, False)
-        btn.afc.error.AFC_error.assert_not_called()
-
-    def test_too_fast_release_ignored(self):
-        btn = _make_button()
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        btn.afc.function.get_current_lane_obj.return_value = None
-        btn.afc.CHANGE_TOOL = MagicMock()
-        btn._button_callback(100.03, False)  # 0.03s < 0.05s threshold
-        btn.afc.CHANGE_TOOL.assert_not_called()
-
-    def test_press_time_cleared_after_release(self):
-        btn = _make_button()
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        btn.afc.function.get_current_lane_obj.return_value = None
-        btn.afc.CHANGE_TOOL = MagicMock()
-        btn._button_callback(100.2, False)
-        assert btn._press_time is None
+class TestConstants:
+    def test_max_num_moves(self):
+        assert afcBoxTurtle.MAX_NUM_MOVES == 40
 
 
-# ── _button_callback – printing guard ────────────────────────────────────────
+# ── system_Test: empty lane (prep=F, load=F) ──────────────────────────────────
 
-class TestButtonCallbackPrintingGuard:
-    def test_error_logged_when_printing(self):
-        btn = _make_button()
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = True
-        btn.afc.error = MagicMock()
-        btn._button_callback(101.0, False)
-        btn.afc.error.AFC_error.assert_called_once()
+class TestSystemTestEmptyLane:
+    def test_empty_lane_sets_not_ready_led(self):
+        """prep=False, load=False → LED set to led_not_ready."""
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=False, load_state=False)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        unit.afc.function.afc_led.assert_any_call(lane.led_not_ready, lane.led_index)
 
-    def test_press_time_not_cleared_when_printing_guard_fires(self):
-        """On printing guard, we return early; press_time may or may not clear."""
-        btn = _make_button()
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = True
-        btn.afc.error = MagicMock()
-        btn._button_callback(100.5, False)
-        # Core assertion: error raised
-        btn.afc.error.AFC_error.assert_called_once()
+    def test_empty_lane_does_not_set_fault_led(self):
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=False, load_state=False)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        for c in unit.afc.function.afc_led.call_args_list:
+            assert c[0][0] != lane.led_fault
 
 
-# ── _button_callback – short press ───────────────────────────────────────────
+# ── system_Test: fault lane (prep=F, load=T) ─────────────────────────────────
 
-class TestButtonCallbackShortPress:
-    def test_short_press_no_active_lane_loads_this_lane(self):
-        btn = _make_button("lane1")
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        btn.afc.function.get_current_lane_obj.return_value = None
-        btn.afc.CHANGE_TOOL = MagicMock()
-        # 0.3s press < long_press_duration (1.2s)
-        btn._button_callback(100.3, False)
-        btn.afc.CHANGE_TOOL.assert_called_once_with(btn.lane_obj)
+class TestSystemTestFaultLane:
+    def test_fault_state_sets_fault_led(self):
+        """prep=False, load=True → LED set to led_fault."""
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=False, load_state=True)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        unit.afc.function.afc_led.assert_any_call(lane.led_fault, lane.led_index)
 
-    def test_short_press_with_this_lane_active_unloads(self):
-        btn = _make_button("lane1")
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        cur_lane = MagicMock()
-        cur_lane.name = "lane1"  # Same as this button's lane
-        btn.afc.function.get_current_lane_obj.return_value = cur_lane
-        btn.afc.TOOL_UNLOAD = MagicMock()
-        btn._button_callback(100.3, False)
-        btn.afc.TOOL_UNLOAD.assert_called_once_with(cur_lane)
-
-    def test_short_press_with_different_lane_active_loads_this_lane(self):
-        btn = _make_button("lane1")
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        cur_lane = MagicMock()
-        cur_lane.name = "lane2"  # Different lane
-        btn.afc.function.get_current_lane_obj.return_value = cur_lane
-        btn.afc.CHANGE_TOOL = MagicMock()
-        btn._button_callback(100.3, False)
-        btn.afc.CHANGE_TOOL.assert_called_once_with(btn.lane_obj)
+    def test_fault_state_calls_do_enable_false(self):
+        """Faulted lane should disable stepper."""
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=False, load_state=True)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        lane.do_enable.assert_called_with(False)
 
 
-# ── _button_callback – long press ────────────────────────────────────────────
+# ── system_Test: loaded (prep=T, load=T) ──────────────────────────────────────
 
-class TestButtonCallbackLongPress:
-    def test_long_press_no_active_lane_ejects(self):
-        btn = _make_button("lane1", long_press_duration=1.0)
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        btn.afc.function.get_current_lane_obj.return_value = None
-        btn.afc.LANE_UNLOAD = MagicMock()
-        # 1.5s press ≥ long_press_duration (1.0s)
-        btn._button_callback(101.5, False)
-        btn.afc.LANE_UNLOAD.assert_called_once_with(btn.lane_obj)
+class TestSystemTestLoadedLane:
+    def test_loaded_sets_ready_led(self):
+        """prep=True, load=True → LED set to led_ready."""
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=True, load_state=True)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        unit.afc.function.afc_led.assert_any_call(lane.led_ready, lane.led_index)
 
-    def test_long_press_with_this_lane_active_unloads_then_ejects(self):
-        btn = _make_button("lane1", long_press_duration=1.0)
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        cur_lane = MagicMock()
-        cur_lane.name = "lane1"
-        btn.afc.function.get_current_lane_obj.return_value = cur_lane
-        btn.afc.TOOL_UNLOAD = MagicMock(return_value=True)
-        btn.afc.LANE_UNLOAD = MagicMock()
-        btn._button_callback(101.5, False)
-        btn.afc.TOOL_UNLOAD.assert_called_once()
-        btn.afc.LANE_UNLOAD.assert_called_once_with(btn.lane_obj)
-
-    def test_long_press_with_different_lane_active_ejects_only(self):
-        btn = _make_button("lane1", long_press_duration=1.0)
-        btn._press_time = 100.0
-        btn.afc.function.is_printing.return_value = False
-        cur_lane = MagicMock()
-        cur_lane.name = "lane2"
-        btn.afc.function.get_current_lane_obj.return_value = cur_lane
-        btn.afc.LANE_UNLOAD = MagicMock()
-        btn.afc.TOOL_UNLOAD = MagicMock()
-        btn._button_callback(101.5, False)
-        btn.afc.LANE_UNLOAD.assert_called_once_with(btn.lane_obj)
-        btn.afc.TOOL_UNLOAD.assert_not_called()
+    def test_loaded_sets_status_to_loaded(self):
+        from extras.AFC_lane import AFCLaneState
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=True, load_state=True)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        assert lane.status == AFCLaneState.LOADED
 
 
-# ── __init__ via MockConfig ───────────────────────────────────────────────────
+# ── system_Test: locked not loaded (prep=T, load=F) ──────────────────────────
 
-class TestAFCButtonInit:
-    def test_init_registers_ready_event_handler(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(name="AFC_button lane1", printer=printer,
-                            values={"pin": "PA0", "long_press_duration": 1.2})
-        btn = AFCButton(config)
-        assert "klippy:ready" in printer._event_handlers
+class TestSystemTestLockedNotLoaded:
+    def test_locked_not_loaded_sets_not_ready_led(self):
+        """prep=True, load=False → LED set to led_not_ready."""
+        unit = _make_box_turtle()
+        lane = _make_lane(prep_state=True, load_state=False)
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        unit.afc.function.afc_led.assert_any_call(lane.led_not_ready, lane.led_index)
 
-    def test_init_sets_lane_id_from_config_name(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(name="AFC_button lane_x", printer=printer,
-                            values={"pin": "PB1", "long_press_duration": 1.0})
-        btn = AFCButton(config)
-        assert btn.lane_id == "lane_x"
 
-    def test_init_registers_button_callback(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        buttons_mock = MagicMock()
-        printer._objects["buttons"] = buttons_mock
-        config = MockConfig(name="AFC_button lane1", printer=printer,
-                            values={"pin": "PC2", "long_press_duration": 1.2})
-        btn = AFCButton(config)
-        buttons_mock.register_buttons.assert_called_once()
-        call_args = buttons_mock.register_buttons.call_args[0]
-        assert "PC2" in call_args[0]
+# ── system_Test: reactor pause called when no movement ───────────────────────
+
+class TestSystemTestReactorPause:
+    def test_reactor_pause_called_when_no_movement(self):
+        unit = _make_box_turtle()
+        lane = _make_lane()
+        pause_mock = MagicMock()
+        unit.afc.reactor.pause = pause_mock
+        unit.system_Test(lane, delay=0.0, assignTcmd=True, enable_movement=False)
+        pause_mock.assert_called()
+
+# ── _move_lane ──────────────────────────────────────────────────
+class Test_MoveLane:
+    def test_returns_not_enable_movement_loaded(self):
+        from unittest.mock import PropertyMock
+        unit = _make_box_turtle()
+        lane = _make_lane()
+        type(lane).load_state = PropertyMock(side_effect=[True])
+
+        result = unit._move_lane(lane, delay=1, enable_movement=False)
+        assert result is True
+    
+    def test_returns_not_enable_movement_not_loaded(self):
+        from unittest.mock import PropertyMock
+        unit = _make_box_turtle()
+        lane = _make_lane()
+        type(lane).load_state = PropertyMock(side_effect=[False])
+
+        result = unit._move_lane(lane, delay=1, enable_movement=False)
+        assert result is False
+    
+    def test_returns_enable_movement_not_loaded(self):
+        from unittest.mock import PropertyMock
+        unit = _make_box_turtle()
+        lane = _make_lane()
+        pause_mock = MagicMock()
+        unit.afc.reactor.pause = pause_mock
+        type(lane).load_state = PropertyMock(side_effect=[False])
+
+        result = unit._move_lane(lane, delay=1, enable_movement=True)
+        assert result is False
+        pause_mock.assert_called()

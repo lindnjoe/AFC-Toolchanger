@@ -1,12 +1,12 @@
 """
-Unit tests for extras/AFC_assist.py
+Unit tests for extras/AFC.py
 
 Covers:
-  - AFCassistMotor: attribute initialization
-  - _set_pin: pin state changes, same-value skip, is_resend, PWM vs digital
-  - get_status: returns correct dict
-  - EspoolerDir: direction constants
-  - AFCEspoolerStats: direction/start_time/end_time setters, reset, update
+  - State: string constants
+  - AFC_VERSION: version string format
+  - afc._remove_after_last: string helper
+  - afc._get_message: message queue peek and pop
+  - afc.get_status: returns required keys
 """
 
 from __future__ import annotations
@@ -14,254 +14,364 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 import pytest
 
-from extras.AFC_assist import AFCassistMotor, EspoolerDir, AFCEspoolerStats
+from extras.AFC import afc, State, AFC_VERSION
 
-PIN_MIN_TIME = 0.100  # Must match source constant
+
+# ── State constants ───────────────────────────────────────────────────────────
+
+class TestStateConstants:
+    def test_init_value(self):
+        assert State.INIT == "Initialized"
+
+    def test_idle_value(self):
+        assert State.IDLE == "Idle"
+
+    def test_error_value(self):
+        assert State.ERROR == "Error"
+
+    def test_loading_value(self):
+        assert State.LOADING == "Loading"
+
+    def test_unloading_value(self):
+        assert State.UNLOADING == "Unloading"
+
+    def test_ejecting_lane_value(self):
+        assert State.EJECTING_LANE == "Ejecting"
+
+    def test_moving_lane_value(self):
+        assert State.MOVING_LANE == "Moving"
+
+    def test_restoring_pos_value(self):
+        assert State.RESTORING_POS == "Restoring"
+
+    def test_all_constants_are_strings(self):
+        attrs = [a for a in dir(State) if not a.startswith("_")]
+        for attr in attrs:
+            assert isinstance(getattr(State, attr), str)
+
+    def test_all_constants_unique(self):
+        attrs = [a for a in dir(State) if not a.startswith("_")]
+        values = [getattr(State, a) for a in attrs]
+        assert len(values) == len(set(values))
+
+
+# ── AFC_VERSION ───────────────────────────────────────────────────────────────
+
+class TestAfcVersion:
+    def test_version_is_string(self):
+        assert isinstance(AFC_VERSION, str)
+
+    def test_version_has_dots(self):
+        assert "." in AFC_VERSION
+
+    def test_version_parts_are_numeric(self):
+        parts = AFC_VERSION.split(".")
+        for part in parts:
+            assert part.isdigit(), f"Non-numeric version part: {part!r}"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_assist_motor(is_pwm=False):
-    """Build an AFCassistMotor bypassing the complex __init__."""
-    motor = AFCassistMotor.__new__(AFCassistMotor)
-    motor.is_pwm = is_pwm
-    motor.scale = 1.0
-    motor.mcu_pin = MagicMock()
-    motor.last_value = 0.0
-    motor.last_print_time = 0.0
-    motor.resend_interval = 0.0
-    motor.resend_timer = None
-    motor.reactor = MagicMock()
-    motor.shutdown_value = 0.0
-    return motor
+def _make_afc():
+    """Build an afc instance bypassing __init__."""
+    obj = afc.__new__(afc)
+
+    from tests.conftest import MockAFC, MockLogger, MockPrinter
+
+    inner = MockAFC()
+    printer = MockPrinter(afc=inner)
+    obj.printer = printer
+    obj.logger = MockLogger()
+    obj.reactor = inner.reactor
+    obj.moonraker = None
+    obj.function = MagicMock()
+    obj.message_queue = []
+    # obj.current = MagicMock()
+    obj.current_loading = None
+    obj.next_lane_load = None
+    obj.current_state = State.IDLE
+    obj.error_state = False
+    obj.position_saved = False
+    obj.spoolman = None
+    obj._td1_present = False
+    obj.lane_data_enabled = False
+    obj.units = {}
+    obj.lanes = {}
+    obj.tools = {}
+    obj.hubs = {}
+    obj.buffers = {}
+    obj.tool_cmds = {}
+    obj.led_state = True
+    obj.current_toolchange = 0
+    obj.number_of_toolchanges = 0
+    obj.temp_wait_tolerance = 5
+    obj._get_bypass_state = MagicMock(return_value=False)
+    obj._get_quiet_mode = MagicMock(return_value=False)
+    return obj
 
 
-def _make_espooler_stats():
-    """Build an AFCEspoolerStats bypassing __init__."""
-    from tests.conftest import MockLogger
-    stats = AFCEspoolerStats.__new__(AFCEspoolerStats)
-    stats._n20_runtime_fwd = MagicMock()
-    stats._n20_runtime_rwd = MagicMock()
-    stats._n20_runtime_fwd.value = 0
-    stats._n20_runtime_rwd.value = 0
-    stats._fwd_updated = False
-    stats._rwd_updated = False
-    stats._direction = None
-    stats._direction_start = None
-    stats._direction_end = None
-    stats._delta = None
-    stats.logger = MockLogger()
-    return stats
+# ── _remove_after_last ────────────────────────────────────────────────────────
+
+class TestRemoveAfterLast:
+    def test_removes_after_last_slash(self):
+        obj = _make_afc()
+        result = obj._remove_after_last("/home/user/file.txt", "/")
+        assert result == "/home/user/"
+
+    def test_no_char_returns_original(self):
+        obj = _make_afc()
+        result = obj._remove_after_last("nodots", ".")
+        assert result == "nodots"
+
+    def test_char_at_end(self):
+        obj = _make_afc()
+        result = obj._remove_after_last("trailing/", "/")
+        assert result == "trailing/"
+
+    def test_single_char_string(self):
+        obj = _make_afc()
+        result = obj._remove_after_last("/", "/")
+        assert result == "/"
+
+    def test_multiple_occurrences_uses_last(self):
+        obj = _make_afc()
+        result = obj._remove_after_last("a/b/c/d", "/")
+        assert result == "a/b/c/"
 
 
-# ── Initialization ────────────────────────────────────────────────────────────
+# ── _get_message ──────────────────────────────────────────────────────────────
 
-class TestAFCassistMotorInit:
-    def test_last_value_initially_zero(self):
-        motor = _make_assist_motor()
-        assert motor.last_value == 0.0
+class TestGetMessage:
+    def test_empty_queue_returns_empty_strings(self):
+        obj = _make_afc()
+        msg = obj._get_message()
+        assert msg["message"] == ""
+        assert msg["type"] == ""
 
-    def test_last_print_time_initially_zero(self):
-        motor = _make_assist_motor()
-        assert motor.last_print_time == 0.0
+    def test_peek_does_not_remove(self):
+        obj = _make_afc()
+        obj.message_queue = [("hello", "info")]
+        obj._get_message(clear=False)
+        assert len(obj.message_queue) == 1
 
-    def test_resend_interval_initially_zero(self):
-        motor = _make_assist_motor()
-        assert motor.resend_interval == 0.0
+    def test_peek_returns_message(self):
+        obj = _make_afc()
+        obj.message_queue = [("hello", "info")]
+        msg = obj._get_message(clear=False)
+        assert msg["message"] == "hello"
+        assert msg["type"] == "info"
 
-    def test_is_pwm_stored(self):
-        motor = _make_assist_motor(is_pwm=True)
-        assert motor.is_pwm is True
+    def test_clear_removes_first_item(self):
+        obj = _make_afc()
+        obj.message_queue = [("first", "error"), ("second", "warning")]
+        obj._get_message(clear=True)
+        assert len(obj.message_queue) == 1
+        assert obj.message_queue[0][0] == "second"
 
-    def test_scale_default_one(self):
-        motor = _make_assist_motor()
-        assert motor.scale == 1.0
+    def test_clear_returns_popped_message(self):
+        obj = _make_afc()
+        obj.message_queue = [("popped", "error")]
+        msg = obj._get_message(clear=True)
+        assert msg["message"] == "popped"
+        assert msg["type"] == "error"
 
-
-# ── _set_pin ──────────────────────────────────────────────────────────────────
-
-class TestSetPin:
-    def test_same_value_no_resend_skips_pin(self):
-        """When value matches last_value and is_resend=False, pin is not touched."""
-        motor = _make_assist_motor(is_pwm=False)
-        motor.last_value = 0.5
-        motor._set_pin(0.0, 0.5, is_resend=False)
-        motor.mcu_pin.set_digital.assert_not_called()
-        motor.mcu_pin.set_pwm.assert_not_called()
-
-    def test_same_value_with_resend_calls_digital_pin(self):
-        """When is_resend=True, pin is called even if value is the same."""
-        motor = _make_assist_motor(is_pwm=False)
-        motor.last_value = 1.0
-        motor._set_pin(1.0, 1.0, is_resend=True)
-        motor.mcu_pin.set_digital.assert_called()
-
-    def test_digital_pin_called_when_not_pwm(self):
-        motor = _make_assist_motor(is_pwm=False)
-        motor._set_pin(0.0, 1.0)
-        motor.mcu_pin.set_digital.assert_called()
-        motor.mcu_pin.set_pwm.assert_not_called()
-
-    def test_pwm_pin_called_when_pwm(self):
-        motor = _make_assist_motor(is_pwm=True)
-        motor._set_pin(0.0, 0.75)
-        motor.mcu_pin.set_pwm.assert_called()
-        motor.mcu_pin.set_digital.assert_not_called()
-
-    def test_last_value_updated_after_set(self):
-        motor = _make_assist_motor()
-        motor._set_pin(0.0, 1.0)
-        assert motor.last_value == 1.0
-
-    def test_last_print_time_updated_after_set(self):
-        motor = _make_assist_motor()
-        motor._set_pin(1.5, 1.0)
-        # print_time = max(1.5, 0.0 + 0.1) = 1.5
-        assert motor.last_print_time == 1.5
-
-    def test_print_time_minimum_enforced(self):
-        """print_time is clamped to max(requested, last + PIN_MIN_TIME)."""
-        motor = _make_assist_motor(is_pwm=False)
-        motor.last_print_time = 5.0
-        motor._set_pin(0.0, 1.0)  # 0.0 < 5.0 + 0.1 = 5.1 → clamped
-        call_args = motor.mcu_pin.set_digital.call_args
-        actual_time = call_args[0][0]
-        assert actual_time >= 5.0 + PIN_MIN_TIME
+    def test_clear_on_empty_returns_empty(self):
+        obj = _make_afc()
+        msg = obj._get_message(clear=True)
+        assert msg["message"] == ""
+        assert msg["type"] == ""
 
 
 # ── get_status ────────────────────────────────────────────────────────────────
 
 class TestGetStatus:
-    def test_returns_dict_with_value_key(self):
-        motor = _make_assist_motor()
-        motor.last_value = 0.42
-        status = motor.get_status(0.0)
-        assert "value" in status
+    def test_returns_required_keys(self):
+        obj = _make_afc()
+        status = obj.get_status()
+        required = {
+            "current_load", "current_state", "error_state",
+            "lanes", "extruders", "hubs", "buffers", "units",
+            "message", "position_saved",
+        }
+        for key in required:
+            assert key in status, f"Missing key: {key}"
 
-    def test_value_reflects_last_value(self):
-        motor = _make_assist_motor()
-        motor.last_value = 0.75
-        status = motor.get_status(0.0)
-        assert status["value"] == 0.75
+    def test_lanes_is_list(self):
+        obj = _make_afc()
+        assert isinstance(obj.get_status()["lanes"], list)
 
+    def test_extruders_is_list(self):
+        obj = _make_afc()
+        assert isinstance(obj.get_status()["extruders"], list)
 
-# ── EspoolerDir ───────────────────────────────────────────────────────────────
+    def test_hubs_is_list(self):
+        obj = _make_afc()
+        assert isinstance(obj.get_status()["hubs"], list)
 
-class TestEspoolerDir:
-    def test_fwd_constant(self):
-        assert EspoolerDir.FWD == "Forwards"
+    def test_units_is_list(self):
+        obj = _make_afc()
+        assert isinstance(obj.get_status()["units"], list)
 
-    def test_rwd_constant(self):
-        assert EspoolerDir.RWD == "Reverse"
+    def test_error_state_reflects_attribute(self):
+        obj = _make_afc()
+        obj.error_state = True
+        assert obj.get_status()["error_state"] is True
 
+    def test_current_load_none_when_nothing_loaded(self):
+        obj = _make_afc()
+        obj.function.get_current_lane.return_value = None
+        assert obj.get_status()["current_load"] is None
 
-# ── AFCEspoolerStats: direction setter ────────────────────────────────────────
-
-class TestAFCEspoolerStatsDirection:
-    def test_direction_set_when_none(self):
-        stats = _make_espooler_stats()
-        stats.direction = EspoolerDir.FWD
-        assert stats._direction == EspoolerDir.FWD
-
-    def test_direction_not_overwritten_when_already_set(self):
-        stats = _make_espooler_stats()
-        stats._direction = EspoolerDir.FWD
-        stats.direction = EspoolerDir.RWD
-        assert stats._direction == EspoolerDir.FWD
-
-
-# ── AFCEspoolerStats: start_time setter ───────────────────────────────────────
-
-class TestAFCEspoolerStatsStartTime:
-    def test_start_time_set_when_none(self):
-        stats = _make_espooler_stats()
-        stats.start_time = 100.0
-        assert stats._direction_start == 100.0
-
-    def test_start_time_not_overwritten_when_set(self):
-        stats = _make_espooler_stats()
-        stats._direction_start = 50.0
-        stats.start_time = 200.0
-        assert stats._direction_start == 50.0
+    def test_message_from_queue(self):
+        obj = _make_afc()
+        obj.message_queue = [("test msg", "warning")]
+        msg = obj.get_status()["message"]
+        assert msg["message"] == "test msg"
 
 
-# ── AFCEspoolerStats: end_time setter ─────────────────────────────────────────
+# ── _check_extruder_temp ──────────────────────────────────────────────────────
 
-class TestAFCEspoolerStatsEndTime:
-    def test_end_time_when_no_direction_does_nothing(self):
-        """If _direction is None, end_time setter returns early (no delta calc)."""
-        stats = _make_espooler_stats()
-        stats.end_time = 200.0
-        assert stats._direction is None  # nothing changed
+def _make_afc_for_check_extruder_temp(
+    heater_target_temp,
+    actual_temp,
+    target_material_temp,
+    lower_extruder_temp_on_change=True,
+    using_min_value=False,
+):
+    from tests.test_AFC_lane import _make_afc_lane
+    """Build an afc instance wired up for _check_extruder_temp tests."""
+    obj = _make_afc()
+    obj.lower_extruder_temp_on_change = lower_extruder_temp_on_change
+    obj._wait_for_temp_within_tolerance = MagicMock()
 
-    def test_fwd_runtime_incremented(self):
-        stats = _make_espooler_stats()
-        stats._direction = EspoolerDir.FWD
-        stats._direction_start = 100.0
-        stats._n20_runtime_fwd.value = 0
-        stats.end_time = 105.0
-        assert stats._fwd_updated is True
+    heater = MagicMock()
+    heater.target_temp = heater_target_temp
+    heater.can_extrude = False
+    heater.get_temp = MagicMock(return_value=(actual_temp, 0.0))
 
-    def test_rwd_runtime_incremented(self):
-        stats = _make_espooler_stats()
-        stats._direction = EspoolerDir.RWD
-        stats._direction_start = 100.0
-        stats._n20_runtime_rwd.value = 0
-        stats.end_time = 108.0
-        assert stats._rwd_updated is True
+    extruder = MagicMock()
+    extruder.get_heater.return_value = heater
 
-    def test_state_reset_after_end_time_set(self):
-        stats = _make_espooler_stats()
-        stats._direction = EspoolerDir.FWD
-        stats._direction_start = 100.0
-        stats.end_time = 105.0
-        assert stats._direction is None
-        assert stats._direction_start is None
-        assert stats._direction_end is None
+    lane = _make_afc_lane()
+    lane.extruder_obj.toolhead_extruder = MagicMock()
+    lane.extruder_obj.toolhead_extruder = extruder
 
-    def test_no_delta_when_end_not_after_start(self):
-        """When end_time <= start_time, no delta is applied."""
-        stats = _make_espooler_stats()
-        stats._direction = EspoolerDir.FWD
-        stats._direction_start = 100.0
-        stats._n20_runtime_fwd.value = 0
-        stats.end_time = 99.0  # end < start → no update
-        assert stats._fwd_updated is False
+    obj.toolhead = MagicMock()
+    obj.toolhead.get_extruder.return_value = extruder
+
+    pheaters = MagicMock()
+    obj.printer._objects["heaters"] = pheaters
+
+    obj.function.is_printing.return_value = False
+    obj._get_default_material_temps = MagicMock(
+        return_value=(float(target_material_temp), using_min_value)
+    )
+
+    return obj, heater, extruder, pheaters, lane
 
 
-# ── AFCEspoolerStats: reset_runtimes ─────────────────────────────────────────
+class TestCheckExtruderTemp:
+    """Tests for afc._check_extruder_temp().
 
-class TestResetRuntimes:
-    def test_fwd_reset_called(self):
-        stats = _make_espooler_stats()
-        stats.reset_runtimes()
-        stats._n20_runtime_fwd.reset_count.assert_called_once()
+    Covers the two-action logic:
+      need_lower: set temp > target+5 → lower without waiting
+      need_heat:  set temp < target-5 → heat and wait
+      skip_lower: need_lower AND lower_extruder_temp_on_change=False
+                  AND actual temp already sufficient → skip the lower call
+    """
 
-    def test_rwd_reset_called(self):
-        stats = _make_espooler_stats()
-        stats.reset_runtimes()
-        stats._n20_runtime_rwd.reset_count.assert_called_once()
+    # ── Default behaviour (lower_extruder_temp_on_change=True) ───────────────
 
+    def test_lowers_to_target_when_above(self):
+        
+        """Set temp more than 5° above target → lower to target, no wait."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=250, actual_temp=248, target_material_temp=210
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is False
 
-# ── AFCEspoolerStats: update_database ────────────────────────────────────────
+    def test_heats_to_target_when_below(self):
+        """Set temp more than 5° below target → heat to target and wait."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=210
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
+        obj._wait_for_temp_within_tolerance.assert_called_once_with(obj.heater, 210,
+                                                                    obj.temp_wait_tolerance*2)
+        assert result is True
 
-class TestUpdateDatabase:
-    def test_fwd_database_updated_when_flag_set(self):
-        stats = _make_espooler_stats()
-        stats._fwd_updated = True
-        stats.update_database()
-        stats._n20_runtime_fwd.update_database.assert_called_once()
-        assert stats._fwd_updated is False
+    def test_no_change_when_within_range(self):
+        """Set temp within ±5° of target → no set_temperature call."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=212, actual_temp=210, target_material_temp=210
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_not_called()
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is False
 
-    def test_rwd_database_updated_when_flag_set(self):
-        stats = _make_espooler_stats()
-        stats._rwd_updated = True
-        stats.update_database()
-        stats._n20_runtime_rwd.update_database.assert_called_once()
-        assert stats._rwd_updated is False
+    def test_no_lower_when_using_min_extrude_temp(self):
+        """When using min_extrude_temp fallback, do not lower even if above target+5."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=250, actual_temp=248, target_material_temp=210,
+            using_min_value=True,
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_not_called()
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is False
 
-    def test_no_update_when_neither_flag_set(self):
-        stats = _make_espooler_stats()
-        stats.update_database()
-        stats._n20_runtime_fwd.update_database.assert_not_called()
-        stats._n20_runtime_rwd.update_database.assert_not_called()
+    # ── lower_extruder_temp_on_change=False ──────────────────────────────────
+
+    def test_skip_lower_when_disabled_and_actual_sufficient(self):
+        """lower=False, actual ≥ target-5 → lowering is skipped entirely."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=250, actual_temp=248, target_material_temp=210,
+            lower_extruder_temp_on_change=False,
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_not_called()
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is False
+
+    def test_lower_not_skipped_when_actual_insufficient(self):
+        """lower=False but actual < target-5 → skip_lower stays False, lower fires."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=250, actual_temp=200, target_material_temp=210,
+            lower_extruder_temp_on_change=False,
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_any_call(heater, 210.0)
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is False
+
+    def test_heating_unaffected_by_lower_flag(self):
+        """lower=False does not suppress heating up to a higher target."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=210,
+            lower_extruder_temp_on_change=False,
+        )
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_called_once_with(heater, 210.0)
+        obj._wait_for_temp_within_tolerance.assert_called_once_with(obj.heater, 210,
+                                                                    obj.temp_wait_tolerance*2)
+        assert result is True
+
+    # ── Early-return guard ────────────────────────────────────────────────────
+
+    def test_no_change_when_printing(self):
+        """can_extrude=True + is_printing=True → early return, no temp change."""
+        obj, heater, extruder, pheaters, lane = _make_afc_for_check_extruder_temp(
+            heater_target_temp=150, actual_temp=148, target_material_temp=210
+        )
+        heater.can_extrude = True
+        obj.function.is_printing.return_value = True
+        result = obj._check_extruder_temp(lane)
+        pheaters.set_temperature.assert_not_called()
+        obj._wait_for_temp_within_tolerance.assert_not_called()
+        assert result is None
+    # TODO: add passing in a no_wait variable

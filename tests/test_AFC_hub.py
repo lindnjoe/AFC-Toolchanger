@@ -1,392 +1,424 @@
 """
-Unit tests for extras/AFC_hub.py
+Unit tests for extras/AFC_functions.py
 
 Covers:
-  - afc_hub.get_status: returns dict with expected keys and correct values
-  - afc_hub.state property: physical vs virtual hub sensor
-  - afc_hub.switch_pin_callback: updates internal _state
-  - afc_hub.__str__: returns name
-  - afc_hub.handle_runout: only triggers for the currently-loaded lane
+  - HexConvert: comma-separated RGBA float string → "#rrggbb"
+  - HexToLedString: hex string → comma-separated float list
+  - _get_led_indexes: "1-4,9,10" → [1,2,3,4,9,10]
+  - _calc_length: bowden length arithmetic (reset / +/- / direct)
+  - check_macro_present: detects macro in gcode handlers
+  - get_filament_status: returns correct status string for lane state
+  - afcDeltaTime: timing delta helper class
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import MagicMock
 import pytest
 
-from extras.AFC_hub import afc_hub
+from extras.AFC_functions import afcFunction, afcDeltaTime
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_hub(switch_pin="PA0", name="test_hub", extra_values=None):
-    """Build an afc_hub instance by bypassing __init__ and setting attrs."""
-    hub = afc_hub.__new__(afc_hub)
+def _make_func():
+    """Build an afcFunction instance bypassing __init__."""
+    func = afcFunction.__new__(afcFunction)
 
-    from tests.conftest import MockAFC, MockPrinter, MockReactor, MockLogger
+    from tests.conftest import MockAFC, MockLogger
 
     afc = MockAFC()
-    reactor = MockReactor()
-    printer = MockPrinter(afc=afc)
-    printer._reactor = reactor
-
-    hub.printer = printer
-    hub.afc = afc
-    hub.reactor = reactor
-    hub.gcode = afc.gcode
-
-    hub.fullname = f"AFC_hub {name}"
-    hub.name = name
-    hub.unit = None
-    hub.lanes = {}
-    hub._state = False
-    hub.switch_pin = switch_pin
-
-    # Default config values
-    hub.hub_clear_move_dis = 65.0
-    hub.afc_bowden_length = 900.0
-    hub.td1_bowden_length = 850.0
-    hub.afc_unload_bowden_length = 900.0
-    hub.assisted_retract = False
-    hub.move_dis = 75.0
-    hub.cut = False
-    hub.cut_cmd = None
-    hub.cut_servo_name = "cut"
-    hub.cut_dist = 50.0
-    hub.cut_clear = 120.0
-    hub.cut_min_length = 200.0
-    hub.cut_servo_pass_angle = 0.0
-    hub.cut_servo_clip_angle = 160.0
-    hub.cut_servo_prep_angle = 75.0
-    hub.cut_confirm = False
-    hub.config_bowden_length = hub.afc_bowden_length
-    hub.config_unload_bowden_length = hub.afc_unload_bowden_length
-    hub.enable_sensors_in_gui = False
-    hub.debounce_delay = 0.1
-    hub.enable_runout = False
-
-    # Filament sensor mock (used in handle_runout)
-    hub.fila = MagicMock()
-    hub.fila.runout_helper.min_event_systime = 0.0
-    hub.fila.runout_helper.event_delay = 0.5
-    hub.debounce_button = MagicMock()
-
-    if extra_values:
-        for k, v in extra_values.items():
-            setattr(hub, k, v)
-
-    return hub
+    func.afc = afc
+    func.logger = MockLogger()
+    func.printer = MagicMock()
+    func.config = MagicMock()
+    func.auto_var_file = None
+    func.errorLog = {}
+    func.pause = False
+    func.mcu = MagicMock()
+    return func
 
 
-# ── __str__ ───────────────────────────────────────────────────────────────────
+# ── HexConvert ────────────────────────────────────────────────────────────────
 
-class TestAFCHubStr:
-    def test_str_returns_name(self):
-        hub = _make_hub(name="hub1")
-        assert str(hub) == "hub1"
+class TestHexConvert:
+    def test_full_brightness_red(self):
+        func = _make_func()
+        result = func.HexConvert("1,0,0")
+        assert result == "#ff0000"
 
+    def test_full_brightness_green(self):
+        func = _make_func()
+        result = func.HexConvert("0,1,0")
+        assert result == "#00ff00"
 
-# ── switch_pin_callback ───────────────────────────────────────────────────────
+    def test_full_brightness_blue(self):
+        func = _make_func()
+        result = func.HexConvert("0,0,1")
+        assert result == "#0000ff"
 
-class TestSwitchPinCallback:
-    def test_callback_sets_state_true(self):
-        hub = _make_hub()
-        hub.switch_pin_callback(100.0, True)
-        assert hub._state is True
+    def test_all_zeros_black(self):
+        func = _make_func()
+        result = func.HexConvert("0,0,0")
+        assert result == "#000000"
 
-    def test_callback_sets_state_false(self):
-        hub = _make_hub()
-        hub._state = True
-        hub.switch_pin_callback(101.0, False)
-        assert hub._state is False
+    def test_half_red(self):
+        func = _make_func()
+        result = func.HexConvert("0.5,0,0")
+        # 0.5 * 255 = 127 → 0x7f
+        assert result == "#7f0000"
 
+    def test_white_no_w_channel(self):
+        func = _make_func()
+        # Only first 3 channels used in HexConvert
+        result = func.HexConvert("1,1,1")
+        assert result == "#ffffff"
 
-# ── state property ────────────────────────────────────────────────────────────
-
-class TestStateProperty:
-    def test_physical_switch_returns_internal_state(self):
-        hub = _make_hub(switch_pin="PA0")
-        hub._state = True
-        assert hub.state is True
-
-    def test_physical_switch_false(self):
-        hub = _make_hub(switch_pin="PA0")
-        hub._state = False
-        assert hub.state is False
-
-    def test_virtual_hub_true_when_any_lane_load_state_true(self):
-        hub = _make_hub(switch_pin="virtual")
-        lane1 = MagicMock()
-        lane1.raw_load_state = False
-        lane2 = MagicMock()
-        lane2.raw_load_state = True
-        hub.lanes = {"lane1": lane1, "lane2": lane2}
-        assert hub.state is True
-
-    def test_virtual_hub_false_when_all_lanes_not_loaded(self):
-        hub = _make_hub(switch_pin="virtual")
-        lane1 = MagicMock()
-        lane1.raw_load_state = False
-        lane2 = MagicMock()
-        lane2.raw_load_state = False
-        hub.lanes = {"lane1": lane1, "lane2": lane2}
-        assert hub.state is False
-
-    def test_virtual_hub_false_when_no_lanes(self):
-        hub = _make_hub(switch_pin="virtual")
-        hub.lanes = {}
-        assert hub.state is False
+    def test_returns_string_starting_with_hash(self):
+        func = _make_func()
+        result = func.HexConvert("1,0.5,0")
+        assert result.startswith("#")
+        assert len(result) == 7
 
 
-# ── get_status ────────────────────────────────────────────────────────────────
+# ── HexToLedString ────────────────────────────────────────────────────────────
 
-class TestGetStatus:
-    def test_get_status_returns_dict(self):
-        hub = _make_hub()
-        result = hub.get_status()
-        assert isinstance(result, dict)
+class TestHexToLedString:
+    def test_black_returns_all_zeros(self):
+        func = _make_func()
+        result = func.HexToLedString("000000")
+        assert result[0] == pytest.approx(0.0)
+        assert result[1] == pytest.approx(0.0)
+        assert result[2] == pytest.approx(0.0)
 
-    def test_get_status_contains_state(self):
-        hub = _make_hub()
-        hub._state = False
-        result = hub.get_status()
-        assert "state" in result
-        assert result["state"] is False
+    def test_white_sets_w_channel(self):
+        func = _make_func()
+        result = func.HexToLedString("FFFFFF")
+        assert result[3] == 1.0
 
-    def test_get_status_cut_flag(self):
-        hub = _make_hub()
-        hub.cut = True
-        result = hub.get_status()
-        assert result["cut"] is True
+    def test_red_channel(self):
+        func = _make_func()
+        result = func.HexToLedString("FF0000")
+        assert result[0] == pytest.approx(1.0)
+        assert result[1] == pytest.approx(0.0)
+        assert result[2] == pytest.approx(0.0)
 
-    def test_get_status_cut_cmd_default_none(self):
-        hub = _make_hub()
-        result = hub.get_status()
-        assert result["cut_cmd"] is None
+    def test_non_white_sets_w_zero(self):
+        func = _make_func()
+        result = func.HexToLedString("FF0000")
+        assert result[3] == 0.0
 
-    def test_get_status_bowden_length(self):
-        hub = _make_hub()
-        hub.afc_bowden_length = 1200.0
-        result = hub.get_status()
-        assert result["afc_bowden_length"] == 1200.0
-
-    def test_get_status_lanes_list(self):
-        hub = _make_hub()
-        lane1 = MagicMock()
-        lane1.name = "lane1"
-        lane2 = MagicMock()
-        lane2.name = "lane2"
-        hub.lanes = {"lane1": lane1, "lane2": lane2}
-        result = hub.get_status()
-        assert set(result["lanes"]) == {"lane1", "lane2"}
-
-    def test_get_status_servo_angles(self):
-        hub = _make_hub()
-        hub.cut_servo_pass_angle = 10.0
-        hub.cut_servo_clip_angle = 170.0
-        hub.cut_servo_prep_angle = 80.0
-        result = hub.get_status()
-        assert result["cut_servo_pass_angle"] == 10.0
-        assert result["cut_servo_clip_angle"] == 170.0
-        assert result["cut_servo_prep_angle"] == 80.0
-
-    def test_get_status_cut_distances(self):
-        hub = _make_hub()
-        hub.cut_dist = 60.0
-        hub.cut_clear = 130.0
-        hub.cut_min_length = 250.0
-        result = hub.get_status()
-        assert result["cut_dist"] == 60.0
-        assert result["cut_clear"] == 130.0
-        assert result["cut_min_length"] == 250.0
+    def test_returns_four_values(self):
+        func = _make_func()
+        result = func.HexToLedString("123456")
+        assert len(result) == 4
 
 
-# ── handle_runout ─────────────────────────────────────────────────────────────
+# ── _get_led_indexes ──────────────────────────────────────────────────────────
 
-class TestHandleRunout:
-    def test_runout_triggers_current_lane_in_hub(self):
-        hub = _make_hub()
+class TestGetLedIndexes:
+    def test_single_index(self):
+        func = _make_func()
+        assert func._get_led_indexes("5") == [5]
+
+    def test_range_expands(self):
+        func = _make_func()
+        assert func._get_led_indexes("1-4") == [1, 2, 3, 4]
+
+    def test_comma_separated(self):
+        func = _make_func()
+        assert func._get_led_indexes("9,10") == [9, 10]
+
+    def test_range_and_singles(self):
+        func = _make_func()
+        assert func._get_led_indexes("1-4,9,10") == [1, 2, 3, 4, 9, 10]
+
+    def test_single_element_range(self):
+        func = _make_func()
+        assert func._get_led_indexes("3-3") == [3]
+
+
+# ── _calc_length ──────────────────────────────────────────────────────────────
+
+class TestCalcLength:
+    def test_reset_returns_config_length(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "reset")
+        assert result == 500.0
+
+    def test_reset_case_insensitive(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "RESET")
+        assert result == 500.0
+
+    def test_positive_delta(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "+50")
+        assert result == pytest.approx(650.0)
+
+    def test_negative_delta(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "-100")
+        assert result == pytest.approx(500.0)
+
+    def test_direct_value(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "750")
+        assert result == pytest.approx(750.0)
+
+    def test_invalid_delta_returns_current(self):
+        func = _make_func()
+        result = func._calc_length(500.0, 600.0, "+abc")
+        assert result == 600.0
+
+
+# ── check_macro_present ───────────────────────────────────────────────────────
+
+class TestCheckMacroPresentFunction:
+    def test_returns_true_when_macro_exists(self):
+        func = _make_func()
+        func.afc.gcode.ready_gcode_handlers = {"MY_MACRO": MagicMock()}
+        assert func.check_macro_present("MY_MACRO") is True
+
+    def test_returns_false_when_macro_missing(self):
+        func = _make_func()
+        func.afc.gcode.ready_gcode_handlers = {}
+        assert func.check_macro_present("MISSING_MACRO") is False
+
+    def test_returns_false_when_no_handlers_attr(self):
+        func = _make_func()
+        # gcode has no ready_gcode_handlers attr
+        if hasattr(func.afc.gcode, "ready_gcode_handlers"):
+            del func.afc.gcode.ready_gcode_handlers
+        assert func.check_macro_present("ANYTHING") is False
+
+
+# ── get_filament_status ───────────────────────────────────────────────────────
+
+class TestGetFilamentStatus:
+    def _make_lane(self, prep=False, load=False, tool_loaded=False):
         lane = MagicMock()
-        hub.lanes = {"lane1": lane}
-        hub.afc.current = "lane1"
-        hub.handle_runout(100.0)
-        lane.handle_hub_runout.assert_called_once_with(sensor=hub.name)
+        lane.prep_state = prep
+        lane.load_state = load
+        lane.name = "lane1"
+        lane.led_tool_loaded = "0,1,0,0"
+        lane.led_ready = "0,1,0,0"
+        lane.led_prep_loaded = "0,0.5,0,0"
+        lane.led_not_ready = "0,0,0,0.25"
+        lane.material = "PLA"
+        if tool_loaded:
+            ext = MagicMock()
+            ext.lane_loaded = "lane1"
+            lane.extruder_obj = ext
+        else:
+            if lane.extruder_obj:
+                lane.extruder_obj.lane_loaded = ""
+        return lane
 
-    def test_runout_does_not_trigger_if_current_lane_not_in_hub(self):
-        hub = _make_hub()
+    def test_not_ready_when_not_prep(self):
+        func = _make_func()
+        lane = self._make_lane(prep=False, load=False)
+        status = func.get_filament_status(lane)
+        assert "Not Ready" in status
+
+    def test_prep_only_when_prep_no_load(self):
+        func = _make_func()
+        lane = self._make_lane(prep=True, load=False)
+        status = func.get_filament_status(lane)
+        assert "Prep" in status
+
+    def test_ready_when_prep_and_load(self):
+        func = _make_func()
+        lane = self._make_lane(prep=True, load=True, tool_loaded=False)
+        lane.extruder_obj = MagicMock()
+        lane.extruder_obj.lane_loaded = "other_lane"
+        status = func.get_filament_status(lane)
+        assert "Ready" in status
+
+    def test_in_tool_when_tool_loaded(self):
+        func = _make_func()
+        lane = self._make_lane(prep=True, load=True, tool_loaded=True)
+        status = func.get_filament_status(lane)
+        assert "In Tool" in status
+
+
+class TestHandleActivateExtruder:
+    def _make_lane(
+        self,
+        name,
+        unit_name,
+        buffer_obj,
+        *,
+        buffer_name=None,
+        prep_state=False,
+        load_state=False,
+        tool_loaded=False,
+    ):
         lane = MagicMock()
-        hub.lanes = {"lane1": lane}
-        hub.afc.current = "lane2"  # Different lane
-        hub.handle_runout(100.0)
-        lane.handle_hub_runout.assert_not_called()
+        lane.name = name
+        lane.unit_obj = MagicMock()
+        lane.unit_obj.name = unit_name
+        lane.buffer_obj = buffer_obj
+        lane.buffer_name = buffer_name
+        lane.prep_state = prep_state
+        lane.load_state = load_state
+        lane.tool_loaded = tool_loaded
+        lane.spool_id = f"spool_{name}"
+        lane.do_enable = MagicMock()
+        lane.disable_buffer = MagicMock()
+        lane.unsync_to_extruder = MagicMock()
+        lane.sync_to_extruder = MagicMock()
+        lane.enable_buffer = MagicMock()
+        return lane
 
-    def test_runout_does_not_trigger_when_no_current(self):
-        hub = _make_hub()
-        lane = MagicMock()
-        hub.lanes = {"lane1": lane}
-        hub.afc.current = None
-        hub.handle_runout(100.0)
-        lane.handle_hub_runout.assert_not_called()
+    def test_shared_buffer_non_active_lane_is_not_disabled(self):
+        func = _make_func()
+        shared_buffer = object()
+        active_lane = self._make_lane("lane_active", "unit_a", shared_buffer)
+        non_active_shared = self._make_lane("lane_shared", "unit_a", shared_buffer)
+        non_active_other = self._make_lane("lane_other", "unit_b", object())
+        func.afc.lanes = {
+            active_lane.name: active_lane,
+            non_active_shared.name: non_active_shared,
+            non_active_other.name: non_active_other,
+        }
+        func.get_current_lane_obj = MagicMock(return_value=active_lane)
 
-    def test_runout_updates_min_event_systime(self):
-        hub = _make_hub()
-        hub.lanes = {}
-        hub.afc.current = None
-        initial_time = hub.fila.runout_helper.min_event_systime
-        hub.handle_runout(150.0)
-        # min_event_systime should be updated to monotonic + event_delay
-        assert hub.fila.runout_helper.min_event_systime != initial_time
+        func._handle_activate_extruder(0)
 
+        non_active_shared.disable_buffer.assert_not_called()
+        non_active_other.disable_buffer.assert_called_once()
+        active_lane.enable_buffer.assert_called_once()
 
-# ── handle_connect ────────────────────────────────────────────────────────────
+    def test_unshared_non_active_lane_is_still_disabled(self):
+        func = _make_func()
+        active_lane = self._make_lane("lane_active", "unit_a", object())
+        non_active_lane = self._make_lane("lane_other", "unit_b", object())
+        func.afc.lanes = {
+            active_lane.name: active_lane,
+            non_active_lane.name: non_active_lane,
+        }
+        func.get_current_lane_obj = MagicMock(return_value=active_lane)
 
-class TestHandleConnect:
-    def test_physical_hub_handle_connect_does_not_raise(self):
-        hub = _make_hub(switch_pin="PA0")
-        # physical pin — no lane validation needed
-        hub.handle_connect()  # should not raise
-        assert hub.gcode is hub.afc.gcode
+        func._handle_activate_extruder(0)
 
-    def test_virtual_hub_raises_when_lanes_have_no_load_sensor(self):
-        from configparser import Error as config_error
-        hub = _make_hub(switch_pin="virtual")
-        lane = MagicMock()
-        lane.fullname = "AFC_stepper lane1"
-        lane.load = None  # no load sensor
-        hub.lanes = {"lane1": lane}
-        with pytest.raises(config_error):
-            hub.handle_connect()
+        non_active_lane.disable_buffer.assert_called_once()
 
-    def test_virtual_hub_no_error_when_all_lanes_have_load_sensor(self):
-        hub = _make_hub(switch_pin="virtual")
-        lane = MagicMock()
-        lane.fullname = "AFC_stepper lane1"
-        lane.load = MagicMock()  # has load sensor
-        hub.lanes = {"lane1": lane}
-        hub.handle_connect()  # should not raise
-
-    def test_handle_connect_sends_register_macros_event(self):
-        hub = _make_hub(switch_pin="PA0")
-        hub.handle_connect()
-        # Verify the event was dispatched (MockPrinter records handlers)
-        # send_event on MockPrinter calls registered handlers — no assert needed
-        # if we got here without error, the event path ran
-        assert True
-
-
-# ── afc_hub.__init__ ──────────────────────────────────────────────────────────
-
-class TestAFCHubInit:
-    def test_virtual_hub_init_does_not_call_add_filament_switch(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(
-            name="AFC_hub test_hub", printer=printer,
-            values={"switch_pin": "virtual", "afc_bowden_length": 900.0}
+    def test_shared_buffer_name_non_active_lane_is_not_disabled(self):
+        func = _make_func()
+        active_lane = self._make_lane(
+            "lane_active",
+            "unit_a",
+            None,
+            buffer_name="FPS_buffer2",
         )
-        with patch("extras.AFC_hub.add_filament_switch") as mock_afs:
-            hub = afc_hub(config)
-        mock_afs.assert_not_called()
-
-    def test_virtual_hub_init_registers_hub_in_afc(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(
-            name="AFC_hub my_hub", printer=printer,
-            values={"switch_pin": "virtual"}
+        non_active_shared_name = self._make_lane(
+            "lane_shared",
+            "unit_a",
+            object(),
+            buffer_name="FPS_buffer2",
         )
-        hub = afc_hub(config)
-        assert "my_hub" in afc.hubs
-
-    def test_virtual_hub_sets_name_from_config(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(
-            name="AFC_hub hub_one", printer=printer,
-            values={"switch_pin": "virtual"}
+        non_active_other_name = self._make_lane(
+            "lane_other",
+            "unit_b",
+            object(),
+            buffer_name="FPS_buffer3",
         )
-        hub = afc_hub(config)
-        assert hub.name == "hub_one"
+        func.afc.lanes = {
+            active_lane.name: active_lane,
+            non_active_shared_name.name: non_active_shared_name,
+            non_active_other_name.name: non_active_other_name,
+        }
+        func.get_current_lane_obj = MagicMock(return_value=active_lane)
 
-    def test_physical_hub_init_calls_add_filament_switch(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
+        func._handle_activate_extruder(0)
+
+        non_active_shared_name.disable_buffer.assert_not_called()
+        non_active_other_name.disable_buffer.assert_called_once()
+
+
+# ── afcDeltaTime ──────────────────────────────────────────────────────────────
+
+class TestAfcDeltaTime:
+    def _make_delta(self):
+        from tests.conftest import MockAFC
         afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        config = MockConfig(
-            name="AFC_hub phys_hub", printer=printer,
-            values={"switch_pin": "PA0"}
-        )
-        with patch("extras.AFC_hub.add_filament_switch") as mock_afs:
-            mock_afs.return_value = (MagicMock(), MagicMock())
-            hub = afc_hub(config)
-        mock_afs.assert_called_once()
+        return afcDeltaTime(afc)
 
-    def test_physical_hub_registers_button_callback(self):
-        from tests.conftest import MockConfig, MockPrinter, MockAFC
-        afc = MockAFC()
-        printer = MockPrinter(afc=afc)
-        buttons_mock = MagicMock()
-        printer._objects["buttons"] = buttons_mock
-        config = MockConfig(
-            name="AFC_hub phys_hub", printer=printer,
-            values={"switch_pin": "PA0"}
-        )
-        with patch("extras.AFC_hub.add_filament_switch") as mock_afs:
-            mock_afs.return_value = (MagicMock(), MagicMock())
-            hub = afc_hub(config)
-        buttons_mock.register_buttons.assert_called_once()
+    def test_set_start_time_sets_start(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        assert dt.start_time is not None
+
+    def test_set_start_time_sets_last_time(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        assert dt.last_time is not None
+
+    def test_log_with_time_logs_message(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        dt.log_with_time("test message", debug=True)
+        debug_msgs = [m for lvl, m in dt.logger.messages if lvl == "debug"]
+        assert any("test message" in m for m in debug_msgs)
+
+    def test_log_with_time_includes_delta(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        dt.log_with_time("delta check", debug=False)
+        info_msgs = [m for lvl, m in dt.logger.messages if lvl == "info"]
+        assert any("delta check" in m for m in info_msgs)
+
+    def test_log_total_time_returns_float(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        result = dt.log_total_time("total")
+        assert isinstance(result, float)
+        assert result >= 0.0
+
+    def test_log_major_delta_returns_float(self):
+        dt = self._make_delta()
+        dt.set_start_time()
+        result = dt.log_major_delta("major delta")
+        assert isinstance(result, float)
+        assert result >= 0.0
+
+    def test_log_with_time_before_set_start_does_not_raise(self):
+        dt = self._make_delta()
+        dt.start_time = None
+        dt.last_time = None
+        # Should not raise (caught internally)
+        dt.log_with_time("safe call")
 
 
-# ── hub_cut ───────────────────────────────────────────────────────────────────
+# ── _rename ───────────────────────────────────────────────────────────────────
 
-class TestHubCut:
-    def test_hub_cut_no_confirm_runs_servo_commands(self):
-        from unittest.mock import PropertyMock
-        hub = _make_hub(switch_pin="PA0")
-        hub.cut_confirm = False
-        cur_lane = MagicMock()
-        # Sequence: loop1 enter(F), loop1 exit(T), loop2 enter(T), loop2 exit(F),
-        #           loop3 enter(F), loop3 exit(T)
-        type(hub).state = PropertyMock(side_effect=[False, True, True, False, False, True])
-        hub.hub_cut(cur_lane)
-        # Should call run_script_from_command for prep, clip, and pass angles
-        calls = hub.gcode.run_script_from_command.call_args_list
-        assert len(calls) >= 3  # prep + clip + pass
+class TestRename:
+    def test_rename_calls_register_command_for_base(self):
+        func = _make_func()
+        func.afc.gcode.register_command = MagicMock(return_value=MagicMock())
+        mock_func = MagicMock()
+        func._rename("RESUME", "_AFC_RENAMED_RESUME_", mock_func, "help text")
+        calls = func.afc.gcode.register_command.call_args_list
+        # Should call at least: register_command("RESUME", None) and
+        # register_command("RESUME", mock_func, ...)
+        names = [c[0][0] for c in calls]
+        assert "RESUME" in names
 
-    def test_hub_cut_no_confirm_calls_correct_servo_angles(self):
-        from unittest.mock import PropertyMock
-        hub = _make_hub(switch_pin="PA0")
-        hub.cut_confirm = False
-        cur_lane = MagicMock()
-        type(hub).state = PropertyMock(side_effect=[False, True, True, False, False, True])
-        hub.hub_cut(cur_lane)
-        calls = [c[0][0] for c in hub.gcode.run_script_from_command.call_args_list]
-        assert any(str(hub.cut_servo_prep_angle) in c for c in calls)
-        assert any(str(hub.cut_servo_clip_angle) in c for c in calls)
-        assert any(str(hub.cut_servo_pass_angle) in c for c in calls)
+    def test_rename_registers_afc_function_under_base_name(self):
+        func = _make_func()
+        mock_func = MagicMock()
+        prev_cmd = MagicMock()
+        # _rename calls register_command 3 times: unregister, re-register old, register new
+        func.afc.gcode.register_command = MagicMock(side_effect=[prev_cmd, None, None])
+        func._rename("RESUME", "_AFC_RENAMED_RESUME_", mock_func, "help")
+        final_call = func.afc.gcode.register_command.call_args_list[-1]
+        assert final_call[0][1] is mock_func
 
-    def test_hub_cut_with_confirm_runs_extra_servo_commands(self):
-        from unittest.mock import PropertyMock
-        hub = _make_hub(switch_pin="PA0")
-        hub.cut_confirm = True
-        cur_lane = MagicMock()
-        type(hub).state = PropertyMock(side_effect=[False, True, True, False, False, True])
-        hub.hub_cut(cur_lane)
-        # With confirm: prep + clip + prep + clip + pass = 5 calls
-        calls = hub.gcode.run_script_from_command.call_args_list
-        assert len(calls) >= 5
-
-    def test_hub_cut_retracts_filament_after_cut(self):
-        from unittest.mock import PropertyMock
-        hub = _make_hub(switch_pin="PA0")
-        hub.cut_confirm = False
-        cur_lane = MagicMock()
-        type(hub).state = PropertyMock(side_effect=[False, True, True, False, False, True])
-        hub.hub_cut(cur_lane)
-        # Last move should be negative (retract by cut_clear)
-        all_move_calls = cur_lane.move.call_args_list
-        last_call_dist = all_move_calls[-1][0][0]
-        assert last_call_dist < 0  # negative = retract
+    def test_rename_logs_debug_when_command_not_found(self):
+        func = _make_func()
+        func.afc.gcode.register_command = MagicMock(return_value=None)
+        func._rename("RESUME", "_AFC_RENAMED_RESUME_", MagicMock(), "help")
+        debug_msgs = [m for lvl, m in func.logger.messages if lvl == "debug"]
+        assert any("RESUME" in m for m in debug_msgs)

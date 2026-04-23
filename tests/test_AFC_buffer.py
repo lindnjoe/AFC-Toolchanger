@@ -1,542 +1,267 @@
 """
-Unit tests for extras/AFC_buffer.py
+Unit tests for extras/AFC_assist.py
 
 Covers:
-  - get_fault_sensitivity: formula validation
-  - fault_detection_enabled / disable / restore
-  - buffer_status: returns last_state
-  - disable_buffer / enable_buffer: toggles enable flag
-  - advance_callback / trailing_callback: state tracking
-  - pause_on_error: respects enable and min_event_systime
-  - update_filament_error_pos / get_extruder_pos
-  - start/stop fault timers
-  - cmd_QUERY_BUFFER string construction
-  - cmd_ENABLE_BUFFER / cmd_DISABLE_BUFFER GCode commands
-  - cmd_AFC_SET_ERROR_SENSITIVITY GCode command
-  - TRAILING_STATE_NAME / ADVANCING_STATE_NAME constants
+  - AFCassistMotor: attribute initialization
+  - _set_pin: pin state changes, same-value skip, is_resend, PWM vs digital
+  - get_status: returns correct dict
+  - EspoolerDir: direction constants
+  - AFCEspoolerStats: direction/start_time/end_time setters, reset, update
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 
-from extras.AFC_buffer import (
-    AFCTrigger,
-    TRAILING_STATE_NAME,
-    ADVANCING_STATE_NAME,
-    CHECK_RUNOUT_TIMEOUT,
-)
-from tests.test_AFC_lane import _make_afc_lane
+from extras.AFC_assist import AFCassistMotor, EspoolerDir, AFCEspoolerStats
+
+PIN_MIN_TIME = 0.100  # Must match source constant
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_buffer(name="TN", error_sensitivity=0.0):
-    """Build an AFCTrigger by bypassing __init__ and setting attributes."""
-    buf = AFCTrigger.__new__(AFCTrigger)
-
-    from tests.conftest import MockAFC, MockReactor, MockLogger
-
-    afc = MockAFC()
-    reactor = MockReactor()
-
-    buf.printer = MagicMock()
-    buf.printer.state_message = "Printer is ready"
-    buf.afc = afc
-    buf.reactor = reactor
-    buf.gcode = afc.gcode
-    buf.logger = afc.logger
-    buf.name = name
-    buf.lanes = {}
-    buf.last_state = "Unknown"
-    buf.enable = False
-    buf.current = ""
-    buf.advance_state = False
-    buf.trailing_state = False
-
-    buf.error_sensitivity = error_sensitivity
-    buf.fault_sensitivity = buf.get_fault_sensitivity(error_sensitivity)
-    buf.filament_error_pos = None
-    buf.past_extruder_position = None
-    buf.extruder_pos_timer = None
-    buf.fault_timer = None
-
-    buf.multiplier_high = 1.1
-    buf.multiplier_low = 0.9
-
-    buf.led = False
-    buf.led_index = None
-    buf.led_advancing = "0,0,1,0"
-    buf.led_trailing = "0,1,0,0"
-    buf.led_buffer_disabled = "0,0,0,0.25"
-
-    buf.min_event_systime = 0.0
-    buf.current_lane = None
-
-    return buf
-
-def _make_lane(buf):
-    lane = _make_afc_lane()
-    lane.buffer_obj = buf
-    buf.lanes[lane.name] = lane
-    return lane
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-class TestConstants:
-    def test_trailing_state_name(self):
-        assert TRAILING_STATE_NAME == "Trailing"
-
-    def test_advancing_state_name(self):
-        assert ADVANCING_STATE_NAME == "Advancing"
-
-    def test_check_runout_timeout_positive(self):
-        assert CHECK_RUNOUT_TIMEOUT > 0
+def _make_assist_motor(is_pwm=False):
+    """Build an AFCassistMotor bypassing the complex __init__."""
+    motor = AFCassistMotor.__new__(AFCassistMotor)
+    motor.is_pwm = is_pwm
+    motor.scale = 1.0
+    motor.mcu_pin = MagicMock()
+    motor.last_value = 0.0
+    motor.last_print_time = 0.0
+    motor.resend_interval = 0.0
+    motor.resend_timer = None
+    motor.reactor = MagicMock()
+    motor.shutdown_value = 0.0
+    return motor
 
 
-# ── get_fault_sensitivity ─────────────────────────────────────────────────────
-
-class TestGetFaultSensitivity:
-    def test_zero_sensitivity_returns_zero(self):
-        buf = _make_buffer()
-        assert buf.get_fault_sensitivity(0) == 0
-
-    def test_min_sensitivity_one(self):
-        buf = _make_buffer()
-        # (11 - 1) * 10 = 100
-        assert buf.get_fault_sensitivity(1) == 100.0
-
-    def test_max_sensitivity_ten(self):
-        buf = _make_buffer()
-        # (11 - 10) * 10 = 10
-        assert buf.get_fault_sensitivity(10) == 10.0
-
-    def test_mid_sensitivity_five(self):
-        buf = _make_buffer()
-        # (11 - 5) * 10 = 60
-        assert buf.get_fault_sensitivity(5) == 60.0
-
-    def test_higher_sensitivity_means_smaller_fault_distance(self):
-        buf = _make_buffer()
-        low = buf.get_fault_sensitivity(2)
-        high = buf.get_fault_sensitivity(8)
-        assert high < low
+def _make_espooler_stats():
+    """Build an AFCEspoolerStats bypassing __init__."""
+    from tests.conftest import MockLogger
+    stats = AFCEspoolerStats.__new__(AFCEspoolerStats)
+    stats._n20_runtime_fwd = MagicMock()
+    stats._n20_runtime_rwd = MagicMock()
+    stats._n20_runtime_fwd.value = 0
+    stats._n20_runtime_rwd.value = 0
+    stats._fwd_updated = False
+    stats._rwd_updated = False
+    stats._direction = None
+    stats._direction_start = None
+    stats._direction_end = None
+    stats._delta = None
+    stats.logger = MockLogger()
+    return stats
 
 
-# ── fault_detection_enabled / disable / restore ───────────────────────────────
+# ── Initialization ────────────────────────────────────────────────────────────
 
-class TestFaultDetection:
-    def test_enabled_when_sensitivity_positive(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        assert buf.fault_detection_enabled() is True
+class TestAFCassistMotorInit:
+    def test_last_value_initially_zero(self):
+        motor = _make_assist_motor()
+        assert motor.last_value == 0.0
 
-    def test_disabled_when_sensitivity_zero(self):
-        buf = _make_buffer(error_sensitivity=0.0)
-        assert buf.fault_detection_enabled() is False
+    def test_last_print_time_initially_zero(self):
+        motor = _make_assist_motor()
+        assert motor.last_print_time == 0.0
 
-    def test_disable_fault_sensitivity_sets_to_zero(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        buf.disable_fault_sensitivity()
-        assert buf.fault_sensitivity == 0
+    def test_resend_interval_initially_zero(self):
+        motor = _make_assist_motor()
+        assert motor.resend_interval == 0.0
 
-    def test_restore_fault_sensitivity_restores_from_error_sensitivity(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        buf.disable_fault_sensitivity()
-        buf.restore_fault_sensitivity()
-        expected = buf.get_fault_sensitivity(5.0)
-        assert buf.fault_sensitivity == expected
+    def test_is_pwm_stored(self):
+        motor = _make_assist_motor(is_pwm=True)
+        assert motor.is_pwm is True
 
-
-# ── buffer_status ─────────────────────────────────────────────────────────────
-
-class TestBufferStatus:
-    def test_returns_last_state(self):
-        buf = _make_buffer()
-        buf.last_state = TRAILING_STATE_NAME
-        assert buf.buffer_status() == TRAILING_STATE_NAME
-
-    def test_returns_unknown_when_unset(self):
-        buf = _make_buffer()
-        assert buf.buffer_status() == "Unknown"
+    def test_scale_default_one(self):
+        motor = _make_assist_motor()
+        assert motor.scale == 1.0
 
 
-# ── disable_buffer / enable_buffer ───────────────────────────────────────────
+# ── _set_pin ──────────────────────────────────────────────────────────────────
 
-class TestBufferToggle:
-    def test_disable_buffer_sets_enable_false(self):
-        lane = _make_afc_lane()
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.lane = lane
-        buf.reset_multiplier = MagicMock()
-        buf.disable_buffer()
-        assert buf.enable is False
+class TestSetPin:
+    def test_same_value_no_resend_skips_pin(self):
+        """When value matches last_value and is_resend=False, pin is not touched."""
+        motor = _make_assist_motor(is_pwm=False)
+        motor.last_value = 0.5
+        motor._set_pin(0.0, 0.5, is_resend=False)
+        motor.mcu_pin.set_digital.assert_not_called()
+        motor.mcu_pin.set_pwm.assert_not_called()
 
-    def test_disable_buffer_calls_reset_multiplier(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.reset_multiplier = MagicMock()
-        buf.disable_buffer()
-        buf.reset_multiplier.assert_called_once()
+    def test_same_value_with_resend_calls_digital_pin(self):
+        """When is_resend=True, pin is called even if value is the same."""
+        motor = _make_assist_motor(is_pwm=False)
+        motor.last_value = 1.0
+        motor._set_pin(1.0, 1.0, is_resend=True)
+        motor.mcu_pin.set_digital.assert_called()
 
-    def test_enable_buffer_sets_enable_true(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.set_multiplier = MagicMock()
-        buf.enable_buffer(lane)
-        assert buf.enable is True
-    
-    def test_enable_buffer_sets_current_lane(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.set_multiplier = MagicMock()
-        buf.enable_buffer(lane)
-        assert buf.current_lane == lane
+    def test_digital_pin_called_when_not_pwm(self):
+        motor = _make_assist_motor(is_pwm=False)
+        motor._set_pin(0.0, 1.0)
+        motor.mcu_pin.set_digital.assert_called()
+        motor.mcu_pin.set_pwm.assert_not_called()
 
-    def test_enable_buffer_applies_multiplier_trailing(self):
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.set_multiplier = MagicMock()
-        buf.last_state = TRAILING_STATE_NAME
-        buf.enable_buffer(lane)
-        call_arg = buf.set_multiplier.call_args[0][0]
-        assert call_arg < 1.0  # should be multiplier_low or derivative
+    def test_pwm_pin_called_when_pwm(self):
+        motor = _make_assist_motor(is_pwm=True)
+        motor._set_pin(0.0, 0.75)
+        motor.mcu_pin.set_pwm.assert_called()
+        motor.mcu_pin.set_digital.assert_not_called()
 
-    def test_enable_buffer_applies_multiplier_advancing(self):
-        buf = _make_buffer()
-        buf.set_multiplier = MagicMock()
-        lane = _make_lane(buf)
-        buf.last_state = ADVANCING_STATE_NAME
-        buf.enable_buffer(lane)
-        call_arg = buf.set_multiplier.call_args[0][0]
-        assert call_arg > 1.0  # should be multiplier_high or derivative
+    def test_last_value_updated_after_set(self):
+        motor = _make_assist_motor()
+        motor._set_pin(0.0, 1.0)
+        assert motor.last_value == 1.0
 
+    def test_last_print_time_updated_after_set(self):
+        motor = _make_assist_motor()
+        motor._set_pin(1.5, 1.0)
+        # print_time = max(1.5, 0.0 + 0.1) = 1.5
+        assert motor.last_print_time == 1.5
 
-# ── advance_callback / trailing_callback ─────────────────────────────────────
-
-class TestCallbacks:
-    def test_advance_callback_records_advance_state(self):
-        buf = _make_buffer()
-        buf.advance_callback(100.0, True)
-        assert buf.advance_state is True
-
-    def test_advance_callback_records_false_state(self):
-        buf = _make_buffer()
-        buf.advance_state = True
-        buf.advance_callback(100.0, False)
-        assert buf.advance_state is False
-
-    def test_advance_callback_sets_last_state_trailing(self):
-        """After an advance event, last_state → TRAILING_STATE_NAME."""
-        buf = _make_buffer()
-        buf.advance_callback(100.0, True)
-        assert buf.last_state == TRAILING_STATE_NAME
-
-    def test_trailing_callback_records_trailing_state(self):
-        buf = _make_buffer()
-        buf.trailing_callback(100.0, True)
-        assert buf.trailing_state is True
-
-    def test_trailing_callback_sets_last_state_advancing(self):
-        """After a trailing event, last_state → ADVANCING_STATE_NAME."""
-        buf = _make_buffer()
-        buf.trailing_callback(100.0, True)
-        assert buf.last_state == ADVANCING_STATE_NAME
-
-
-# ── pause_on_error ────────────────────────────────────────────────────────────
-
-class TestPauseOnError:
-    def test_does_not_pause_when_disabled(self):
-        buf = _make_buffer()
-        buf.enable = False
-        buf.afc.error = MagicMock()
-        buf.pause_on_error("fault", pause=True)
-        buf.afc.error.AFC_error.assert_not_called()
-
-    def test_does_not_pause_before_min_event_systime(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 9_999_999.0  # far in the future
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.pause_on_error("fault", pause=True)
-        buf.afc.error.AFC_error.assert_not_called()
-
-    def test_does_not_pause_when_already_paused(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = True
-        buf.pause_on_error("fault", pause=True)
-        buf.afc.error.AFC_error.assert_not_called()
-
-    def test_pauses_when_all_conditions_met(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.last_state = TRAILING_STATE_NAME
-        buf.pause_on_error("Something went wrong", pause=True)
-        buf.afc.error.AFC_error.assert_called_once()
-
-    def test_clog_message_appended_when_trailing(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.last_state = TRAILING_STATE_NAME
-        buf.pause_on_error("Base message", pause=True)
-        call_msg = buf.afc.error.AFC_error.call_args[0][0]
-        assert "CLOG" in call_msg
-
-    def test_not_feeding_message_appended_when_advancing(self):
-        buf = _make_buffer()
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.last_state = ADVANCING_STATE_NAME
-        buf.pause_on_error("Base message", pause=True)
-        call_msg = buf.afc.error.AFC_error.call_args[0][0]
-        assert "NOT FEEDING" in call_msg
-
-
-# ── fault timer helpers ───────────────────────────────────────────────────────
-
-class TestFaultTimers:
-    def test_start_fault_timer_sets_fault_timer_running(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = MagicMock()
-        buf.start_fault_timer(100.0)
-        assert buf.fault_timer == "Running"
-
-    def test_stop_fault_timer_sets_fault_timer_stopped(self):
-        buf = _make_buffer()
-        buf.extruder_pos_timer = MagicMock()
-        buf.stop_fault_timer(100.0)
-        assert buf.fault_timer == "Stopped"
-
-
-# ── extruder_pos_update_event ─────────────────────────────────────────────────
-
-class TestExtruderPosUpdateEvent:
-    def test_returns_eventtime_plus_timeout(self):
-        buf = _make_buffer()
-        buf.get_extruder_pos = MagicMock(return_value=None)
-        buf.afc.function.is_printing.return_value = False
-        result = buf.extruder_pos_update_event(50.0)
-        assert result == 50.0 + CHECK_RUNOUT_TIMEOUT
-
-    def test_triggers_pause_when_extruder_pos_exceeds_threshold(self):
-        buf = _make_buffer(error_sensitivity=5.0)
-        buf.enable = True
-        buf.min_event_systime = 0.0
-        buf.filament_error_pos = 50.0
-        buf.afc.error = MagicMock()
-        buf.afc.function.is_paused.return_value = False
-        buf.afc.function.is_printing.return_value = True
-        buf.get_extruder_pos = MagicMock(return_value=55.0)  # > 50.0
-        buf.update_filament_error_pos = MagicMock()
-        buf.extruder_pos_update_event(100.0)
-        buf.afc.error.AFC_error.assert_called()
+    def test_print_time_minimum_enforced(self):
+        """print_time is clamped to max(requested, last + PIN_MIN_TIME)."""
+        motor = _make_assist_motor(is_pwm=False)
+        motor.last_print_time = 5.0
+        motor._set_pin(0.0, 1.0)  # 0.0 < 5.0 + 0.1 = 5.1 → clamped
+        call_args = motor.mcu_pin.set_digital.call_args
+        actual_time = call_args[0][0]
+        assert actual_time >= 5.0 + PIN_MIN_TIME
 
 
 # ── get_status ────────────────────────────────────────────────────────────────
 
 class TestGetStatus:
-    def test_returns_dict_with_expected_keys(self):
-        buf = _make_buffer()
-        buf.afc.function.get_current_lane_obj.return_value = None
-        result = buf.get_status()
-        for key in ("state", "lanes", "enabled", "rotation_distance",
-                    "fault_detection_enabled", "error_sensitivity",
-                    "fault_timer", "distance_to_fault"):
-            assert key in result, f"Missing key: {key}"
+    def test_returns_dict_with_value_key(self):
+        motor = _make_assist_motor()
+        motor.last_value = 0.42
+        status = motor.get_status(0.0)
+        assert "value" in status
 
-    def test_enabled_false_by_default(self):
-        buf = _make_buffer()
-        buf.afc.function.get_current_lane_obj.return_value = None
-        result = buf.get_status()
-        assert result["enabled"] is False
-
-    def test_rotation_distance_none_when_not_enabled(self):
-        buf = _make_buffer()
-        result = buf.get_status()
-        assert result["rotation_distance"] is None
+    def test_value_reflects_last_value(self):
+        motor = _make_assist_motor()
+        motor.last_value = 0.75
+        status = motor.get_status(0.0)
+        assert status["value"] == 0.75
 
 
-# ── cmd_ENABLE_BUFFER ─────────────────────────────────────────────────────────
+# ── EspoolerDir ───────────────────────────────────────────────────────────────
 
-class TestCmdEnableBuffer:
-    def test_delegates_to_enable_buffer(self):
-        """cmd_ENABLE_BUFFER should call enable_buffer() exactly once."""
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        gcmd = MagicMock()
-        gcmd.get.return_value = "lane1"
-        buf.enable_buffer = MagicMock()
-        buf.cmd_ENABLE_BUFFER(gcmd)
-        buf.enable_buffer.assert_called_once()
+class TestEspoolerDir:
+    def test_fwd_constant(self):
+        assert EspoolerDir.FWD == "Forwards"
 
-    def test_buffer_is_enabled_after_command(self):
-        """Issuing ENABLE_BUFFER leaves enable set to True."""
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.set_multiplier = MagicMock()
-        gcmd = MagicMock()
-        gcmd.get.return_value = "lane1"
-        buf.cmd_ENABLE_BUFFER(gcmd)
-        assert buf.enable is True
-        assert buf.current_lane == lane
+    def test_rwd_constant(self):
+        assert EspoolerDir.RWD == "Reverse"
 
 
-# ── cmd_DISABLE_BUFFER ────────────────────────────────────────────────────────
+# ── AFCEspoolerStats: direction setter ────────────────────────────────────────
 
-class TestCmdDisableBuffer:
-    def test_delegates_to_disable_buffer(self):
-        """cmd_DISABLE_BUFFER should call disable_buffer() exactly once."""
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.disable_buffer = MagicMock()
-        buf.cmd_DISABLE_BUFFER(MagicMock())
-        buf.disable_buffer.assert_called_once()
+class TestAFCEspoolerStatsDirection:
+    def test_direction_set_when_none(self):
+        stats = _make_espooler_stats()
+        stats.direction = EspoolerDir.FWD
+        assert stats._direction == EspoolerDir.FWD
 
-    def test_buffer_is_disabled_after_command(self):
-        """Issuing DISABLE_BUFFER leaves enable set to False."""
-        buf = _make_buffer()
-        lane = _make_lane(buf)
-        buf.current_lane = lane
-        buf.enable = True
-        buf.reset_multiplier = MagicMock()
-        buf.cmd_DISABLE_BUFFER(MagicMock())
-        assert buf.enable is False
+    def test_direction_not_overwritten_when_already_set(self):
+        stats = _make_espooler_stats()
+        stats._direction = EspoolerDir.FWD
+        stats.direction = EspoolerDir.RWD
+        assert stats._direction == EspoolerDir.FWD
 
 
-# ── cmd_AFC_SET_ERROR_SENSITIVITY ─────────────────────────────────────────────
+# ── AFCEspoolerStats: start_time setter ───────────────────────────────────────
 
-def _gcmd(sensitivity):
-    """Return a mock gcmd whose get_float returns the given sensitivity."""
-    gcmd = MagicMock()
-    gcmd.get_float.return_value = sensitivity
-    return gcmd
+class TestAFCEspoolerStatsStartTime:
+    def test_start_time_set_when_none(self):
+        stats = _make_espooler_stats()
+        stats.start_time = 100.0
+        assert stats._direction_start == 100.0
+
+    def test_start_time_not_overwritten_when_set(self):
+        stats = _make_espooler_stats()
+        stats._direction_start = 50.0
+        stats.start_time = 200.0
+        assert stats._direction_start == 50.0
 
 
-class TestCmdSetErrorSensitivity:
-    def test_updates_error_sensitivity(self):
-        """The new sensitivity value is stored on the buffer."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        assert buf.error_sensitivity == 5.0
+# ── AFCEspoolerStats: end_time setter ─────────────────────────────────────────
 
-    def test_updates_fault_sensitivity(self):
-        """fault_sensitivity is recalculated from the new error_sensitivity."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        assert buf.fault_sensitivity == buf.get_fault_sensitivity(5.0)
+class TestAFCEspoolerStatsEndTime:
+    def test_end_time_when_no_direction_does_nothing(self):
+        """If _direction is None, end_time setter returns early (no delta calc)."""
+        stats = _make_espooler_stats()
+        stats.end_time = 200.0
+        assert stats._direction is None  # nothing changed
 
-    # ── 0 → >0 transition ────────────────────────────────────────────────────
+    def test_fwd_runtime_incremented(self):
+        stats = _make_espooler_stats()
+        stats._direction = EspoolerDir.FWD
+        stats._direction_start = 100.0
+        stats._n20_runtime_fwd.value = 0
+        stats.end_time = 105.0
+        assert stats._fwd_updated is True
 
-    def test_disabled_to_enabled_calls_setup_fault_timer(self):
-        """Transitioning from 0 to >0 calls setup_fault_timer."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        buf.setup_fault_timer.assert_called_once()
+    def test_rwd_runtime_incremented(self):
+        stats = _make_espooler_stats()
+        stats._direction = EspoolerDir.RWD
+        stats._direction_start = 100.0
+        stats._n20_runtime_rwd.value = 0
+        stats.end_time = 108.0
+        assert stats._rwd_updated is True
 
-    def test_disabled_to_enabled_calls_start_fault_detection(self):
-        """Transitioning from 0 to >0 calls start_fault_detection."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        buf.start_fault_detection.assert_called_once()
+    def test_state_reset_after_end_time_set(self):
+        stats = _make_espooler_stats()
+        stats._direction = EspoolerDir.FWD
+        stats._direction_start = 100.0
+        stats.end_time = 105.0
+        assert stats._direction is None
+        assert stats._direction_start is None
+        assert stats._direction_end is None
 
-    def test_disabled_to_enabled_uses_multiplier_low_when_trailing(self):
-        """Transitioning 0 → >0 with trailing state passes multiplier_low."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.last_state = TRAILING_STATE_NAME
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        _, multiplier = buf.start_fault_detection.call_args[0]
-        assert multiplier == buf.multiplier_low
+    def test_no_delta_when_end_not_after_start(self):
+        """When end_time <= start_time, no delta is applied."""
+        stats = _make_espooler_stats()
+        stats._direction = EspoolerDir.FWD
+        stats._direction_start = 100.0
+        stats._n20_runtime_fwd.value = 0
+        stats.end_time = 99.0  # end < start → no update
+        assert stats._fwd_updated is False
 
-    def test_disabled_to_enabled_uses_multiplier_high_when_advancing(self):
-        """Transitioning 0 → >0 with advancing state passes multiplier_high."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.last_state = ADVANCING_STATE_NAME
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        _, multiplier = buf.start_fault_detection.call_args[0]
-        assert multiplier == buf.multiplier_high
 
-    # ── >0 → 0 transition ────────────────────────────────────────────────────
+# ── AFCEspoolerStats: reset_runtimes ─────────────────────────────────────────
 
-    def test_enabled_to_disabled_calls_stop_fault_timer(self):
-        """Transitioning from >0 to 0 calls stop_fault_timer."""
-        buf = _make_buffer(error_sensitivity=5.0)
-        buf.stop_fault_timer = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(0.0))
-        buf.stop_fault_timer.assert_called_once()
+class TestResetRuntimes:
+    def test_fwd_reset_called(self):
+        stats = _make_espooler_stats()
+        stats.reset_runtimes()
+        stats._n20_runtime_fwd.reset_count.assert_called_once()
 
-    def test_enabled_to_disabled_does_not_call_setup_fault_timer(self):
-        """Transitioning from >0 to 0 does not call setup_fault_timer."""
-        buf = _make_buffer(error_sensitivity=5.0)
-        buf.stop_fault_timer = MagicMock()
-        buf.setup_fault_timer = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(0.0))
-        buf.setup_fault_timer.assert_not_called()
+    def test_rwd_reset_called(self):
+        stats = _make_espooler_stats()
+        stats.reset_runtimes()
+        stats._n20_runtime_rwd.reset_count.assert_called_once()
 
-    # ── >0 → >0 transition ───────────────────────────────────────────────────
 
-    def test_enabled_to_enabled_calls_update_filament_error_pos(self):
-        """Transitioning from >0 to another >0 calls update_filament_error_pos."""
-        buf = _make_buffer(error_sensitivity=3.0)
-        buf.update_filament_error_pos = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(7.0))
-        buf.update_filament_error_pos.assert_called_once()
+# ── AFCEspoolerStats: update_database ────────────────────────────────────────
 
-    def test_enabled_to_enabled_does_not_call_stop_fault_timer(self):
-        """Transitioning from >0 to another >0 does not call stop_fault_timer."""
-        buf = _make_buffer(error_sensitivity=3.0)
-        buf.update_filament_error_pos = MagicMock()
-        buf.stop_fault_timer = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(7.0))
-        buf.stop_fault_timer.assert_not_called()
+class TestUpdateDatabase:
+    def test_fwd_database_updated_when_flag_set(self):
+        stats = _make_espooler_stats()
+        stats._fwd_updated = True
+        stats.update_database()
+        stats._n20_runtime_fwd.update_database.assert_called_once()
+        assert stats._fwd_updated is False
 
-    def test_enabled_to_enabled_does_not_call_setup_fault_timer(self):
-        """Transitioning from >0 to another >0 does not call setup_fault_timer."""
-        buf = _make_buffer(error_sensitivity=3.0)
-        buf.update_filament_error_pos = MagicMock()
-        buf.setup_fault_timer = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(7.0))
-        buf.setup_fault_timer.assert_not_called()
+    def test_rwd_database_updated_when_flag_set(self):
+        stats = _make_espooler_stats()
+        stats._rwd_updated = True
+        stats.update_database()
+        stats._n20_runtime_rwd.update_database.assert_called_once()
+        assert stats._rwd_updated is False
 
-    # ── logging ───────────────────────────────────────────────────────────────
-
-    def test_logs_info_with_new_sensitivity(self):
-        """Setting sensitivity logs an info message containing the new value."""
-        buf = _make_buffer(error_sensitivity=0.0)
-        buf.setup_fault_timer = MagicMock()
-        buf.start_fault_detection = MagicMock()
-        buf.logger = MagicMock()
-        buf.cmd_AFC_SET_ERROR_SENSITIVITY(_gcmd(5.0))
-        buf.logger.info.assert_called_once()
-        msg = buf.logger.info.call_args[0][0]
-        assert "5.0" in msg
+    def test_no_update_when_neither_flag_set(self):
+        stats = _make_espooler_stats()
+        stats.update_database()
+        stats._n20_runtime_fwd.update_database.assert_not_called()
+        stats._n20_runtime_rwd.update_database.assert_not_called()
